@@ -15,7 +15,7 @@ JobFit Agent analiza una oferta de trabajo y tu CV, y en segundos entrega:
 
 | Entregable | Descripción |
 |---|---|
-| **A · Diagnóstico de encaje** | Score 0100 + fortalezas y gaps vs. la oferta |
+| **A · Diagnóstico de encaje** | Score 0 a 100 + fortalezas y gaps vs. la oferta |
 | **B · Keywords ATS** | Clasificadas: presentes , débiles  o ausentes  |
 | **C · Plan de cambios** | Lista priorizada: alto / medio / opcional |
 | **D · CV reescrito** | CV completo listo para enviar  descargable en `.txt` y `.docx` |
