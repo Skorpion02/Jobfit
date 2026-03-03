@@ -1,4 +1,12 @@
-﻿#  JobFit Agent
+<p align="center">
+  <img src="assets/banner.png" alt="JobFit Agent banner" width="100%" />
+</p>
+
+<p align="center">
+  <img src="assets/icon.png" alt="JobFit Agent icon" width="120" />
+</p>
+ 
+ #  JobFit Agent
 
 > **Adapta tu CV a cualquier oferta de trabajo con IA local  100% privado, 100% tuyo.**
 
