@@ -152,9 +152,22 @@ USER_AGENT="JobFit Agent 1.0"
 
 ---
 
-##  Licencia
+## 📄 Licencia
 
-MIT  ver [LICENSE](LICENSE) para detalles.
+Este proyecto está bajo la licencia [MIT](LICENSE).
+
+---
+
+## 🤝 Contribuciones
+
+¡Contribuciones, issues y sugerencias son bienvenidas!  
+No dudes en abrir un issue o un pull request.
+
+---
+
+## 📬 Contacto
+
+Para dudas o sugerencias, abre un issue o contacta a través de [Skorpion02](https://github.com/Skorpion02).
 
 ---
 
@@ -164,6 +177,16 @@ MIT  ver [LICENSE](LICENSE) para detalles.
 - [Hugging Face](https://huggingface.co)  modelos de embeddings
 - [Gradio](https://gradio.app)  interfaz web
 
+---
+
+⭐️ **Si te gustó este proyecto, ¡déjale una estrella!**
+
+---
+
 <p align="center">
   <img src="assets/icon.png" alt="JobFit Agent icon" width="48" />
 </p>
+
+<div align="center">
+  <b>Hecho con ❤️ por Skorpion02</b>
+</div>
