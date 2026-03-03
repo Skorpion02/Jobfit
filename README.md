@@ -2,12 +2,6 @@
   <img src="assets/Banner.png" alt="JobFit Agent banner" width="100%" />
 </p>
 
-<p align="center">
-  <img src="assets/icon.png" alt="JobFit Agent icon" width="120" />
-</p>
- 
- #  JobFit Agent
-
 > **Adapta tu CV a cualquier oferta de trabajo con IA local  100% privado, 100% tuyo.**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](https://python.org)
@@ -169,3 +163,7 @@ MIT  ver [LICENSE](LICENSE) para detalles.
 - [LM Studio](https://lmstudio.ai)  runtime de IA local
 - [Hugging Face](https://huggingface.co)  modelos de embeddings
 - [Gradio](https://gradio.app)  interfaz web
+
+<p align="center">
+  <img src="assets/icon.png" alt="JobFit Agent icon" width="48" />
+</p>
