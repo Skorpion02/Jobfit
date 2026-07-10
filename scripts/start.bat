@@ -35,8 +35,8 @@ echo    🚀 Iniciando entorno de desarrollo...
 echo ==========================================
 echo.
 
-:: Cambiar al directorio del proyecto
-cd /d "%~dp0"
+:: Cambiar al directorio raíz del proyecto (este .bat vive en scripts/)
+cd /d "%~dp0\.."
 
 :: Verificar si existe el entorno virtual
 if not exist "venv\" (

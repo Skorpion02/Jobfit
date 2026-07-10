@@ -4,6 +4,14 @@ from typing import Optional
 import re
 import logging
 
+from src.utils.url_safety import (
+    MAX_RESPONSE_BYTES,
+    URLValidationError,
+    read_capped,
+    safe_get,
+    validate_job_url,
+)
+
 # Importar scraper de LinkedIn
 try:
     from .linkedin_job_scraper import scrape_linkedin_job, is_linkedin_job_url
@@ -13,7 +21,7 @@ except ImportError:
     LINKEDIN_AVAILABLE = False
     def scrape_linkedin_job(url: str) -> str:
         raise ValueError("LinkedIn scraper no disponible")
-    
+
     def is_linkedin_job_url(url: str) -> bool:
         return False
 
@@ -30,6 +38,12 @@ class JobScraper:
     def scrape_any_job_offer(self, url: str) -> Optional[str]:
         """Detecta el portal y extrae la descripción de la oferta usando selectores específicos."""
         try:
+            try:
+                url = validate_job_url(url)
+            except URLValidationError as exc:
+                logger.warning("URL rechazada por validación SSRF: %s", exc)
+                return None
+
             # ✅ NUEVA FUNCIONALIDAD: Detectar y procesar URLs de LinkedIn
             if LINKEDIN_AVAILABLE and is_linkedin_job_url(url):
                 logger.info("Detectada URL de LinkedIn, usando scraper específico")
@@ -38,12 +52,13 @@ class JobScraper:
                 except Exception as e:
                     logger.warning(f"Error en scraper de LinkedIn: {e}. Intentando scraping genérico.")
                     # Continuar con scraping genérico como fallback
-            
+
             # Continuar con scraping genérico para otros portales
             domain = self._get_domain(url)
-            response = self.session.get(url, timeout=self.timeout)
+            response = safe_get(self.session, url, timeout=self.timeout)
             response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
+            html_bytes = read_capped(response, MAX_RESPONSE_BYTES)
+            soup = BeautifulSoup(html_bytes, 'html.parser')
 
             if 'indeed' in domain:
                 selectors = [
@@ -103,6 +118,12 @@ class JobScraper:
     def scrape_job_offer(self, url: str) -> Optional[str]:
         """Intenta scraping con múltiples estrategias"""
         try:
+            try:
+                url = validate_job_url(url)
+            except URLValidationError as exc:
+                logger.warning("URL rechazada por validación SSRF: %s", exc)
+                return None
+
             # ✅ NUEVA FUNCIONALIDAD: Verificar LinkedIn primero
             if LINKEDIN_AVAILABLE and is_linkedin_job_url(url):
                 logger.info("Procesando URL de LinkedIn")
@@ -110,25 +131,26 @@ class JobScraper:
                     return scrape_linkedin_job(url)
                 except Exception as e:
                     logger.warning(f"Error en LinkedIn scraper: {e}. Usando método genérico.")
-            
+
             # Estrategia 1: Requests básico
             text = self._scrape_with_requests(url)
             if text and len(text) > 100:
                 return self._clean_text(text)
-            
+
             return None
-                
+
         except Exception as e:
             logger.error(f"Error en scraping: {e}")
             return None
-    
+
     def _scrape_with_requests(self, url: str) -> Optional[str]:
         """Scraping básico con requests"""
         try:
-            response = self.session.get(url, timeout=self.timeout)
+            response = safe_get(self.session, url, timeout=self.timeout)
             response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
+            html_bytes = read_capped(response, MAX_RESPONSE_BYTES)
+
+            soup = BeautifulSoup(html_bytes, 'html.parser')
             
             # Remover scripts y estilos
             for tag in soup(['script', 'style', 'nav', 'footer', 'header']):
@@ -174,17 +196,34 @@ class JobScraper:
         return soup.get_text(strip=True)
     
     def _clean_text(self, text: str) -> str:
-        """Limpia el texto extraído"""
-        # Remover espacios excesivos
-        text = re.sub(r'\s+', ' ', text)
-        
-        # Remover caracteres especiales problemáticos
-        text = re.sub(r'[^\w\s.,;:!?()-]', '', text)
-        
+        """Limpia el texto extraído preservando símbolos relevantes para CVs/ofertas.
+
+        Whitelist (en lugar de la antigua, demasiado restrictiva):
+        - \\w  → alfanumérico Unicode (incluye ñ, acentos)
+        - \\s  → espacios y saltos de línea
+        - .,;:!?'"()[]{}-–—   → puntuación y dashes
+        - /+#&%@°*=<>          → símbolos técnicos (C++, C#, Java 17/21, CI/CD, 70%)
+        - €$£                  → moneda
+        - •·                   → bullets típicos
+        """
+        # Normalizar espacios horizontales (mantener saltos de línea)
+        text = re.sub(r'[ \t]+', ' ', text)
+
+        # Quitar SOLO caracteres de control no imprimibles (mantener \n y \t)
+        text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+
+        # Whitelist amplia para preservar símbolos técnicos
+        text = re.sub(
+            r"[^\w\s.,;:!?'\"()\[\]{}\-–—/+#&%@°*=<>€$£•·]",
+            '',
+            text,
+            flags=re.UNICODE,
+        )
+
         # Limitar longitud
         if len(text) > 10000:
             text = text[:10000] + "..."
-        
+
         return text.strip()
 
     def scrape_linkedin_alternative(

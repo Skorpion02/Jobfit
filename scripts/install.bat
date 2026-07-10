@@ -16,8 +16,8 @@ echo    🔧 Configurando entorno paso a paso...
 echo ==========================================
 echo.
 
-:: Cambiar al directorio del proyecto
-cd /d "%~dp0"
+:: Cambiar al directorio raíz del proyecto (este .bat vive en scripts/)
+cd /d "%~dp0\.."
 
 :: 1. Verificar Python
 echo 🐍 Verificando Python...

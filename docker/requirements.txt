@@ -1,9 +1,12 @@
-# === CORE DEPENDENCIES ===
+# === Dependencias para la imagen Docker (GPU + OCR) ===
+# NOTA: torch NO se incluye aquí; se instala aparte en el Dockerfile como
+# wheel CUDA (pip install torch --index-url https://download.pytorch.org/whl/cu124).
+
+# === CORE ===
 gradio>=4.4.0
 sentence-transformers>=3.0.0
 scikit-learn>=1.3.0
 numpy>=1.24.0
-torch>=2.0.0
 
 # === WEB SCRAPING ===
 requests>=2.31.0
@@ -16,10 +19,9 @@ pdfplumber>=0.10.0
 pymupdf>=1.24.0
 pdf2image>=1.17.0
 
-# === OPTIONAL: OCR para PDFs escaneados (~1.5 GB con modelos) ===
-# Instalar manualmente si se necesita soporte de PDFs escaneados:
-#   pip install easyocr>=1.7.0
-# easyocr>=1.7.0
+# === OCR para PDFs escaneados (habilitado en la imagen Docker) ===
+# Requiere el binario de sistema poppler-utils (instalado en el Dockerfile).
+easyocr>=1.7.0
 
 # === LM STUDIO CLIENT (OpenAI Compatible API) ===
 openai>=1.0.0

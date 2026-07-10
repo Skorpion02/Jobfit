@@ -17,6 +17,8 @@ from pathlib import Path
 # Añadir src al path para imports
 sys.path.append(str(Path(__file__).parent / "src"))
 
+from src.utils.cv_utils import normalize_cv_data  # noqa: E402
+
 # --- Crear directorios necesarios antes de configurar logging ---
 def setup_directories():
     """Crea directorios necesarios si no existen"""
@@ -232,7 +234,9 @@ def run_gradio_app(args):
                     'server_port': port,
                     'share': args.share,
                     'debug': args.debug,
-                    'show_error': True,
+                    # show_error=True filtra tracebacks completos al navegador.
+                    # Solo activado si se invoca con --debug explícitamente.
+                    'show_error': args.debug,
                     'quiet': False
                 }
                 
@@ -335,37 +339,7 @@ def run_cli_mode(args):
                 return
             # Parsear CV
             file_extension = Path(args.cv_path).suffix[1:].lower()
-            cv_data = cv_parser.parse_cv(args.cv_path, file_extension)
-            # Defensive normalization to avoid NoneType iteration errors
-            if cv_data is None:
-                cv_data = {}
-
-            # Ensure lists for sections
-            if not isinstance(cv_data.get('experience'), list):
-                cv_data['experience'] = cv_data.get('experience') or []
-            if not isinstance(cv_data.get('education'), list):
-                cv_data['education'] = cv_data.get('education') or []
-            if not isinstance(cv_data.get('projects'), list):
-                cv_data['projects'] = cv_data.get('projects') or []
-
-            # Normalize skills into a dict with 'technical' and 'other'
-            skills_field = cv_data.get('skills')
-            if isinstance(skills_field, list):
-                cv_data['skills'] = {'technical': skills_field, 'other': []}
-            elif isinstance(skills_field, dict):
-                tech = skills_field.get('technical') or []
-                other = skills_field.get('other') or []
-                if isinstance(tech, str):
-                    tech = [tech]
-                if isinstance(other, str):
-                    other = [other]
-                cv_data['skills'] = {'technical': tech, 'other': other}
-            else:
-                cv_data['skills'] = {'technical': [], 'other': []}
-
-            # Ensure raw_text
-            if not isinstance(cv_data.get('raw_text'), str):
-                cv_data['raw_text'] = ''
+            cv_data = normalize_cv_data(cv_parser.parse_cv(args.cv_path, file_extension))
 
             # Realizar matching
             requirements = (results['job_data'].get('must_have', []) +

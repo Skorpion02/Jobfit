@@ -12,6 +12,8 @@ try:
 except ImportError:
     lmstudio_client = None
 
+from src.utils.cv_utils import normalize_cv_data
+
 
 class CVAdapter:
     """
@@ -26,36 +28,8 @@ class CVAdapter:
         Adapta un CV para una oferta específica basándose en los resultados del matching
         """
         try:
-            # Defensive normalization: asegurarnos de que los campos esperados
-            # tengan tipos consistentes (listas/dicts) para evitar errores
-            # 'NoneType' is not iterable durante la adaptación.
-            if cv is None:
-                cv = {}
-
-            # Normalizar experience, education y projects a listas
-            if not isinstance(cv.get('experience'), list):
-                cv['experience'] = cv.get('experience') or []
-            if not isinstance(cv.get('education'), list):
-                cv['education'] = cv.get('education') or []
-            if not isinstance(cv.get('projects'), list):
-                cv['projects'] = cv.get('projects') or []
-
-            # Normalizar skills a dict con claves 'technical' y 'other'
-            skills_field = cv.get('skills')
-            if isinstance(skills_field, list):
-                cv['skills'] = {'technical': skills_field, 'other': []}
-            elif isinstance(skills_field, dict):
-                # Asegurar listas dentro del dict
-                tech = skills_field.get('technical') or []
-                other = skills_field.get('other') or []
-                # Si alguien guardó por error un string, convertirlo a lista
-                if isinstance(tech, str):
-                    tech = [tech]
-                if isinstance(other, str):
-                    other = [other]
-                cv['skills'] = {'technical': tech, 'other': other}
-            else:
-                cv['skills'] = {'technical': [], 'other': []}
+            # Normalizar estructura del CV (tipos consistentes en todos los campos)
+            cv = normalize_cv_data(cv)
 
             adapted_cv = {
                 'personal_info': self._adapt_personal_info(cv.get('personal_info', {})),

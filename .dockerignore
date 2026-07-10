@@ -1,0 +1,34 @@
+# Entornos y control de versiones
+venv/
+.venv/
+.git/
+.gitignore
+
+# Cachés de Python
+__pycache__/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secretos / config local (se pasa por entorno en runtime)
+.env
+.env.docker
+
+# Datos y salidas generadas (se montan como volúmenes)
+logs/
+exports/
+data/temp/
+
+# Material que no necesita la imagen
+notebooks/
+docs/
+*.bat
+.claude/
+
+# Artefactos Docker (evita auto-copiarse)
+Dockerfile
+.dockerignore
+docker-compose.yml

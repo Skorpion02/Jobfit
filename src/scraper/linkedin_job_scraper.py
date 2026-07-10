@@ -24,6 +24,13 @@ from urllib.parse import urlparse, parse_qs
 import requests
 from bs4 import BeautifulSoup, Tag
 
+from src.utils.url_safety import (
+    MAX_RESPONSE_BYTES,
+    URLValidationError,
+    read_capped,
+    safe_get,
+)
+
 # Configurar logging
 logger = logging.getLogger(__name__)
 
@@ -120,14 +127,18 @@ def fetch_about_html(job_id: str) -> Optional[str]:
         try:
             # Rate limiting más conservador
             time.sleep(RATE_LIMIT_DELAY + i)  # Aumentar delay en cada intento
-            
-            response = session.get(
-                endpoint_url,
-                headers=enhanced_headers,
-                timeout=REQUEST_TIMEOUT,
-                allow_redirects=True
-            )
-            
+
+            try:
+                response = safe_get(
+                    session,
+                    endpoint_url,
+                    headers=enhanced_headers,
+                    timeout=REQUEST_TIMEOUT,
+                )
+            except URLValidationError as exc:
+                logger.warning("URL LinkedIn rechazada por SSRF guard: %s", exc)
+                continue
+
             # Verificar código de respuesta
             if response.status_code == 403:
                 logger.warning(f"Error 403 en endpoint {i+1}: Acceso denegado")
@@ -144,15 +155,25 @@ def fetch_about_html(job_id: str) -> Optional[str]:
                 logger.warning(f"Error HTTP {response.status_code} "
                               f"en endpoint {i+1}")
                 continue
-            
-            # Verificar que tenemos contenido HTML válido
-            if not response.text or len(response.text.strip()) < 500:
-                logger.warning(f"Respuesta muy corta en endpoint {i+1}: "
-                              f"{len(response.text)} chars")
+
+            # Leer cuerpo con corte por tamaño para evitar DoS
+            try:
+                body_bytes = read_capped(response, MAX_RESPONSE_BYTES)
+            except URLValidationError as exc:
+                logger.warning("Respuesta LinkedIn excede el tope: %s", exc)
                 continue
-                
+            body_text = body_bytes.decode(
+                response.encoding or "utf-8", errors="replace"
+            )
+
+            # Verificar que tenemos contenido HTML válido
+            if not body_text or len(body_text.strip()) < 500:
+                logger.warning(f"Respuesta muy corta en endpoint {i+1}: "
+                              f"{len(body_text)} chars")
+                continue
+
             # Verificar que no es una página de login/error
-            text_lower = response.text.lower()
+            text_lower = body_text.lower()
             if any(indicator in text_lower for indicator in [
                 'sign in to linkedin', 'sign in with apple', 'cookie policy',
                 'agree join linkedin', 'new to linkedin', 'privacy policy'
@@ -162,8 +183,8 @@ def fetch_about_html(job_id: str) -> Optional[str]:
                 continue
             
             logger.info(f"HTML obtenido exitosamente: "
-                       f"{len(response.text)} caracteres")
-            return response.text
+                       f"{len(body_text)} caracteres")
+            return body_text
             
         except requests.RequestException as e:
             logger.warning(f"Error de conexión en endpoint {i+1}: {str(e)}")

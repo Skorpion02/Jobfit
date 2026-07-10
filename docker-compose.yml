@@ -1,0 +1,31 @@
+services:
+  jobfit:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: jobfit:latest
+    container_name: jobfit
+    ports:
+      - "7860:7860"
+    environment:
+      # La app lee LMSTUDIO_BASE_URL. Se interpola desde JOBFIT_LMSTUDIO_URL (NO desde
+      # LMSTUDIO_BASE_URL) a proposito: asi el .env del proyecto (uso nativo, con
+      # 'localhost:1234') no sobrescribe este valor. Dentro del contenedor 'localhost' es
+      # el propio contenedor, no el host -> hay que usar host.docker.internal (Docker Desktop)
+      # o la IP real del servidor LLM. Para apuntar a otro servidor: exporta JOBFIT_LMSTUDIO_URL.
+      LMSTUDIO_BASE_URL: ${JOBFIT_LMSTUDIO_URL:-http://host.docker.internal:1234/v1}
+      LMSTUDIO_MODEL: ${JOBFIT_LMSTUDIO_MODEL:-qwen2.5-14b-instruct-1m}
+      USE_LMSTUDIO: ${JOBFIT_USE_LMSTUDIO:-true}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./exports:/app/exports
+    # Acceso a GPU NVIDIA (requiere nvidia-container-toolkit en el host).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped

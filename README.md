@@ -2,191 +2,220 @@
   <img src="assets/Banner.png" alt="JobFit Agent banner" width="100%" />
 </p>
 
-> **Adapta tu CV a cualquier oferta de trabajo con IA local  100% privado, 100% tuyo.**
+> **Adapta tu CV a cualquier oferta de trabajo con IA local. 100 % privado, 100 % tuyo.**
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](https://python.org)
-[![Gradio](https://img.shields.io/badge/Interfaz-Gradio-orange)](https://gradio.app)
+[![Gradio](https://img.shields.io/badge/UI-Gradio-orange?logo=gradio)](https://gradio.app)
 [![LM Studio](https://img.shields.io/badge/IA-LM%20Studio-purple)](https://lmstudio.ai)
-[![License](https://img.shields.io/badge/Licencia-MIT-green)](LICENSE)
+[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](docker/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 ---
 
 ## ¿Qué hace?
 
-JobFit Agent analiza una oferta de trabajo y tu CV, y en segundos entrega:
+JobFit Agent analiza una oferta de trabajo y tu CV y, en una sola pasada, entrega **6 documentos** listos para revisar y enviar:
 
 | Entregable | Descripción |
 |---|---|
-| **A · Diagnóstico de encaje** | Score 0 a 100 + fortalezas y gaps vs. la oferta |
-| **B · Keywords ATS** | Clasificadas: presentes , débiles  o ausentes  |
-| **C · Plan de cambios** | Lista priorizada: alto / medio / opcional |
-| **D · CV reescrito** | CV completo listo para enviar  descargable en `.txt` y `.docx` |
-| **E · Variantes Resumen + Skills** | Versión ATS-first y versión Recruiter-first |
-| **F · Checklist ATS final** | 1215 puntos de validación antes de enviar |
+| **A · Diagnóstico de encaje** | Score 0-100 + top 5 fortalezas y top 5 gaps frente a la oferta |
+| **B · Keywords ATS** | Tabla de 20-40 keywords clasificadas como `presente` / `débil` / `ausente` |
+| **C · Plan de cambios** | 8-15 acciones priorizadas: 🔴 alto · 🟡 medio · 🟢 opcional |
+| **D · CV reescrito** | CV adaptado, sin invenciones, descargable en `.txt` y `.docx` |
+| **E · Variantes Resumen + Skills** | Versión *ATS-first* (keyword-density) y versión *Recruiter-first* (narrativa) |
+| **F · Checklist ATS final** | 12-15 puntos de validación antes de enviar |
 
-> Todo el procesamiento ocurre en tu máquina. Ningún dato sale al exterior.
+> 🔒 Todo el procesamiento ocurre en tu máquina. Ningún dato sale al exterior.
 
 ---
 
-##  Inicio rápido
+## Inicio rápido
+
+### Opción A — Nativo (Windows / macOS / Linux)
 
 ```bash
-# 1. Preparar entorno
+# 1. Clonar e instalar
+git clone https://github.com/Skorpion02/JobFit.git
+cd JobFit
 python -m venv venv
-venv\Scripts\activate
+# Windows:  venv\Scripts\activate
+# macOS/Linux:  source venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Arrancar
+# 2. Arrancar LM Studio (ver guía de configuración) y luego:
 python main.py
-#  Abre http://localhost:7860
+#  → http://localhost:7860
 ```
 
-O con doble clic en Windows:
+En Windows: doble clic en **`start.bat`** y listo (crea venv si no existe, instala deps y arranca).
 
+### Opción B — Docker (GPU NVIDIA)
+
+```bash
+docker compose up -d --build
+#  → http://localhost:7860
 ```
-start_jobfit.bat
-```
+
+Variante CPU-only: `docker compose -f docker-compose.cpu.yml up -d --build`.
+
+> 📘 **Setup detallado + troubleshooting**: [`docs/SETUP.md`](docs/SETUP.md)
 
 ---
 
-##  Configuración de LM Studio
+## Configuración de LM Studio
 
-Sin LM Studio, la app funciona en **modo básico** (reglas). Con LM Studio activo se generan los 6 entregables con calidad profesional.
+Sin LM Studio, JobFit funciona en **modo reglas** (resultados aproximados). Con LM Studio activo se generan los 6 entregables con calidad profesional.
 
-1. Descarga desde [lmstudio.ai](https://lmstudio.ai)
-2. Carga un modelo (Llama 3, Mistral, Qwen)
-3. **Local Server**  **Start Server** (puerto `1234`)
-4. Vuelve a JobFit  detecta la conexión automáticamente
+1. Descarga LM Studio desde [lmstudio.ai](https://lmstudio.ai) (versión ≥ 0.3.10 recomendada).
+2. Descarga un modelo. Recomendaciones según VRAM:
 
----
+   | VRAM disponible | Modelo recomendado | Velocidad aprox. |
+   |---|---|---|
+   | 16 GB+ | `Qwen2.5-14B-Instruct Q4_K_M` (~9 GB) | 35-45 tok/s |
+   | 8-12 GB | `Llama-3.1-8B-Instruct Q6_K` (~6.6 GB) | 70-90 tok/s |
+   | < 8 GB | `Qwen2.5-7B-Instruct Q4_K_M` (~5 GB) | 50-70 tok/s |
 
-##  Estructura del proyecto
-
-```
-JobFit_1/
- main.py                  # Punto de entrada
- start_jobfit.bat         # Launcher Windows (1 clic)
- dev_tools.bat            # Panel de desarrollador
- requirements.txt
-
- src/
-    llm/                 # Cliente LM Studio
-    extractor/           # Parsers CV y ofertas (PDF / DOCX / TXT)
-    auditor/             # Scoring de realismo de ofertas
-    matcher/             # Matching semántico (Sentence Transformers)
-    generator/           # Adaptador CV + analizador ATS completo
-    scraper/             # Extracción desde URLs de empleo
-
- interface/               # Interfaz web Gradio
- config/                  # Settings y prompts del LLM
- data/                    # Templates y archivos temporales
- exports/                 # CVs generados
- tests/                   # Suite de tests
- scripts/                 # Utilidades (check_env, log_viewer)
- docs/                    # Documentación técnica
- logs/                    # Logs de la aplicación
-```
+3. Pestaña **Local Server** → carga el modelo → **Start Server** (puerto `1234`).
+4. JobFit detecta la conexión automáticamente. Ajusta `LMSTUDIO_MODEL` en `.env` si tu modelo tiene otro identificador.
 
 ---
 
-##  Cómo se usa
+## Estructura del proyecto
 
-### 1 · Análisis ATS completo
+```
+JobFit/
+├── main.py                    Punto de entrada (CLI + Gradio)
+├── pyproject.toml             Metadatos, dependencias, tooling
+├── requirements.txt           Mirror para `pip install -r`
+├── start.bat / install.bat / dev_tools.bat   Wrappers de scripts/
+│
+├── src/
+│   ├── scraper/               Extracción de ofertas (genérico + LinkedIn)
+│   ├── extractor/             Parsers CV y oferta (PDF/DOCX/TXT)
+│   ├── auditor/               Scoring de realismo de ofertas
+│   ├── matcher/               Matching semántico (Sentence Transformers)
+│   ├── generator/             Adaptador CV + analizador ATS completo
+│   ├── llm/                   Cliente LM Studio (OpenAI-compat)
+│   └── utils/                 Helpers (anti-SSRF, normalización)
+│
+├── config/                    Settings (.env) y prompts del LLM
+├── interface/                 Aplicación Gradio
+├── tests/                     Suite pytest
+│
+├── docker/                    Imagen Docker (GPU y CPU)
+├── docker-compose*.yml        Lanzadores GPU / CPU
+│
+├── scripts/                   Launchers .bat reales + utilidades
+├── docs/                      Documentación técnica
+├── data/ exports/ logs/       Plantillas, outputs, logs (gitignored)
+├── notebooks/                 Demo en Jupyter
+└── assets/                    Imágenes del README
+```
 
-1. Abre `http://localhost:7860`
-2. Sube tu CV (PDF, DOCX o TXT)
-3. Pega la URL o el texto de la oferta
-4. Ajusta idioma, longitud y nivel si quieres
-5. Pulsa **Analizar**  obtienes los 6 entregables al instante
-6. Descarga el CV reescrito en `.txt` o `.docx`
+> 📐 Detalle de la arquitectura en [`docs/STRUCTURE.md`](docs/STRUCTURE.md).
+
+---
+
+## Cómo se usa
+
+### 1 · Análisis ATS completo (pestaña principal)
+
+1. Abre `http://localhost:7860`.
+2. Sube tu CV (PDF, DOCX o TXT).
+3. Pega la URL de la oferta o su texto completo.
+4. Ajusta idioma, longitud, rol y nivel si quieres.
+5. Pulsa **Analizar** → ves los 6 entregables con barra de progreso por fases.
+6. Descarga el CV reescrito en `.txt` o `.docx`.
 
 El CV generado:
-- Respeta **100% tu experiencia real** (sin inventar nada)
-- Usa títulos de sección correctos, no genéricos
-- No incluye notas, preguntas ni comentarios del sistema
-- Está listo para enviar directamente a la empresa
+- ✅ Respeta el 100 % de tu experiencia real (sin inventar nada).
+- ✅ Usa secciones ATS-friendly (sin tablas, sin columnas, sin iconos).
+- ✅ Sin meta-comentarios del modelo, sin placeholders tipo `[Tu LinkedIn]`.
 
 ### 2 · Auditoría de ofertas
 
-Pega solo la oferta para obtener un score de realismo 0100 con detección de:
-- Contradicciones seniority vs. salario
-- Requisitos imposibles o indefinidos
-- Stack tecnológico incoherente
+Pega solo la oferta y obtén un score de realismo 0-100 con detección de:
+- Contradicciones seniority ↔ salario.
+- Requisitos excesivos o indefinidos.
+- Stack tecnológico incoherente.
 
-### 3 · Matching CV  Oferta
+### 3 · Matching CV ↔ oferta
 
-Compara semánticamente tu perfil con los requisitos de la posición:
-- Algoritmo: `all-MiniLM-L6-v2` (Sentence Transformers)
-- Detecta similitud real, no solo palabras exactas
-- Identifica qué requisitos cubres y cuáles son tus gaps
+Comparación semántica entre tu perfil y los requisitos. Detecta similitudes reales, no solo palabras exactas; identifica qué cubres y cuáles son tus gaps.
 
 ---
 
-##  Herramientas de desarrollo
+## Variables de entorno
 
-```bash
-dev_tools.bat                            # Menú: tests, deps, estado, reset venv
-python -m pytest tests/                  # Todos los tests
-python scripts/log_viewer.py             # Logs en tiempo real
-python scripts/check_env.py              # Verificar entorno
-```
-
----
-
-##  Variables de entorno (`.env`)
+Copia `.env.example` a `.env` y ajusta:
 
 ```env
-LOG_LEVEL=INFO
+LMSTUDIO_BASE_URL=http://localhost:1234/v1
+LMSTUDIO_MODEL=qwen/qwen2.5-14b-instruct
+USE_LMSTUDIO=true
+
+EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
 MAX_CV_SIZE_MB=10
 SCRAPING_TIMEOUT=30
-USER_AGENT="JobFit Agent 1.0"
+```
+
+> 📘 Listado completo y explicación de cada variable: [`docs/SETUP.md#variables-de-entorno`](docs/SETUP.md).
+
+---
+
+## Herramientas de desarrollo
+
+```bash
+dev_tools.bat                 # Menú: tests, deps, estado, reset venv
+python -m pytest              # Suite completa
+pip install -e ".[dev]"       # Instala dev deps (pytest-cov, ruff)
+ruff check .                  # Linter
+python scripts/log_viewer.py  # Tail coloreado de logs
+python scripts/check_env.py   # Verifica entorno e imports
 ```
 
 ---
 
-##  Privacidad
+## Privacidad y seguridad
 
-- **Sin APIs externas**  toda la IA corre localmente con LM Studio
-- **Sin almacenamiento permanente**  CVs procesados en memoria y temporales
-- **Logs locales**  solo información técnica, nunca contenido de CVs
+- 🔒 **Sin APIs externas**: toda la IA corre localmente con LM Studio.
+- 🛡️ **Anti-SSRF en el scraper**: solo dominios de portales de empleo en la allowlist (`linkedin.com`, `indeed.com`, `infojobs.net`, `tecnoempleo.com`, …) y bloqueo de IPs privadas.
+- 📁 **Sin almacenamiento permanente**: CVs procesados en memoria y temporales.
+- 📋 **Logs locales**: solo información técnica, nunca contenido de CVs.
 
 ---
 
-## 📄 Licencia
+## Licencia
 
 Este proyecto está bajo la licencia [MIT](LICENSE).
 
 ---
 
-## 🤝 Contribuciones
+## Contribuciones
 
-¡Contribuciones, issues y sugerencias son bienvenidas!  
-No dudes en abrir un issue o un pull request.
+¡Issues y pull requests son bienvenidos! Antes de abrir un PR:
 
----
-
-## 📬 Contacto
-
-Para dudas o sugerencias, abre un issue o contacta a través de [Skorpion02](https://github.com/Skorpion02).
+1. `pip install -e ".[dev]"`
+2. `ruff check . && pytest`
 
 ---
 
-##  Agradecimientos
+## Contacto
 
-- [LM Studio](https://lmstudio.ai)  runtime de IA local
-- [Hugging Face](https://huggingface.co)  modelos de embeddings
-- [Gradio](https://gradio.app)  interfaz web
+Abre un issue o contacta a través de [Skorpion02](https://github.com/Skorpion02).
 
 ---
 
-⭐️ **Si te gustó este proyecto, ¡déjale una estrella!**
+## Agradecimientos
+
+- [LM Studio](https://lmstudio.ai) — runtime de IA local
+- [Hugging Face](https://huggingface.co) — modelos de embeddings y hub
+- [Gradio](https://gradio.app) — interfaz web
 
 ---
 
 <p align="center">
-  <img src="assets/icon.png" alt="JobFit Agent icon" width="48" />
+  ⭐️ <b>Si te ha sido útil, deja una estrella</b> ⭐️<br>
+  <br>
+  <sub>Hecho con ❤️ por <a href="https://github.com/Skorpion02">Skorpion02</a></sub>
 </p>
-
-<div align="center">
-  <b>Hecho con ❤️ por Skorpion02</b>
-</div>

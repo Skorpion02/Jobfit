@@ -1,0 +1,27 @@
+# Variante CPU-only de JobFit (sin GPU). Uso:
+#   docker compose -f docker-compose.cpu.yml up -d --build
+# El servicio se llama igual ("jobfit") que en docker-compose.yml, pero construye
+# Dockerfile.cpu, etiqueta jobfit:cpu y NO reserva GPU.
+services:
+  jobfit:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cpu
+    image: jobfit:cpu
+    container_name: jobfit-cpu
+    ports:
+      - "7860:7860"
+    environment:
+      # La app lee LMSTUDIO_BASE_URL. Se interpola desde JOBFIT_LMSTUDIO_URL (NO desde
+      # LMSTUDIO_BASE_URL) a proposito: asi el .env del proyecto (uso nativo, con
+      # 'localhost:1234') no sobrescribe este valor. Dentro del contenedor 'localhost' es
+      # el propio contenedor, no el host -> hay que usar host.docker.internal (Docker Desktop)
+      # o la IP real del servidor LLM. Para apuntar a otro servidor: exporta JOBFIT_LMSTUDIO_URL.
+      LMSTUDIO_BASE_URL: ${JOBFIT_LMSTUDIO_URL:-http://host.docker.internal:1234/v1}
+      LMSTUDIO_MODEL: ${JOBFIT_LMSTUDIO_MODEL:-qwen/qwen2.5-14b-instruct}
+      USE_LMSTUDIO: ${JOBFIT_USE_LMSTUDIO:-true}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./exports:/app/exports
+    restart: unless-stopped

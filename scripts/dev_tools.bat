@@ -7,8 +7,8 @@
 
 title JobFit Agent - Modo Desarrollador
 color 0B
-:: Asegurar que trabajamos desde el directorio del script (raíz del proyecto)
-cd /d "%~dp0"
+:: Asegurar que trabajamos desde la raíz del proyecto (este .bat vive en scripts/)
+cd /d "%~dp0\.."
 
 :menu
 cls

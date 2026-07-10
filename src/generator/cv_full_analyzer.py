@@ -9,10 +9,11 @@ Orquesta los 6 entregables del análisis completo ATS:
   F) Checklist ATS final
 """
 
+import hashlib
 import json
 import logging
 import re
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,10 @@ def _cv_to_text(cv_data: dict) -> str:
             parts.append(f"Teléfono: {personal['phone']}")
         if personal.get("location"):
             parts.append(f"Ubicación: {personal['location']}")
+        if personal.get("linkedin"):
+            parts.append(f"LinkedIn: {personal['linkedin']}")
+        if personal.get("github"):
+            parts.append(f"GitHub: {personal['github']}")
 
     summary = cv_data.get("summary") or cv_data.get("profile", "")
     if summary:
@@ -101,8 +106,14 @@ def _cv_to_text(cv_data: dict) -> str:
         parts.append(f"\nIDIOMAS: {', '.join(languages) if isinstance(languages, list) else languages}")
 
     raw = cv_data.get("raw_text", "")
-    if raw and len("\n".join(parts)) < 300:
-        # Fallback si el CV parseado tiene muy poca info
+    has_experience = bool(cv_data.get("experience", []))
+    has_skills = bool(
+        isinstance(cv_data.get("skills"), dict)
+        and (cv_data.get("skills", {}).get("technical") or cv_data.get("skills", {}).get("other"))
+    )
+    # Include raw text when sections are not parsed (common with PDF)
+    # or when the structured text is very short
+    if raw and (len("\n".join(parts)) < 300 or (not has_experience and not has_skills)):
         parts.append(f"\nTEXTO COMPLETO DEL CV:\n{raw[:3000]}")
 
     return "\n".join(parts)
@@ -183,15 +194,44 @@ def _safe_json(response: str, fallback: dict) -> dict:
         return fallback
 
 
-def _llm(prompt: str, max_tokens: int = 2000) -> Optional[str]:
-    """Llama al LLM con el system prompt de ATS."""
+_CJK_RE = re.compile(
+    r"[　-〿぀-ヿㇰ-ㇿ㐀-䶿"
+    r"一-鿿豈-﫿＀-￯]"
+)
+
+
+def _has_cjk(text: str) -> bool:
+    """True si el texto contiene caracteres CJK (chino/japonés/coreano).
+
+    Sirve para detectar la deriva de idioma de modelos tipo Qwen, que a veces
+    intercalan ideogramas en mitad de una respuesta en español/inglés.
+    """
+    return bool(_CJK_RE.search(text or ""))
+
+
+def _llm(
+    prompt: str,
+    max_tokens: int = 2000,
+    json_mode: bool = False,
+    temperature: float = 0.2,
+) -> Optional[str]:
+    """Llama al LLM con el system prompt de ATS.
+
+    json_mode=True fuerza salida estructurada en el servidor (json_schema y,
+    si no, json_object). Úsalo para A/B/C/E/F (esperan JSON). Déjalo en False
+    para D, que devuelve texto plano del CV reescrito.
+
+    temperature por defecto baja (0.2): para extracción/JSON conviene máxima
+    adherencia y reduce la deriva de idioma.
+    """
     if lmstudio_client and lmstudio_client.available:
         try:
             return lmstudio_client.chat_completion(
                 prompt,
                 ATS_SYSTEM_PROMPT,
-                temperature=0.4,
+                temperature=temperature,
                 max_tokens=max_tokens,
+                json_mode=json_mode,
             )
         except Exception as e:  # noqa: BLE001
             logger.error("Error llamando a LM Studio: %s", e)
@@ -210,6 +250,12 @@ class CVFullAnalyzer:
 
     def __init__(self):
         self.llm_available = lmstudio_client is not None and lmstudio_client.available
+        self._cache: Dict[str, dict] = {}
+
+    def clear_cache(self) -> None:
+        """Limpia la caché de resultados de análisis en memoria."""
+        self._cache.clear()
+        logger.info("Caché de análisis ATS limpiada.")
 
     # ── Extracción automática de logros y stack ──
     def _extract_cv_insights(self, cv_text: str):
@@ -219,7 +265,7 @@ class CVFullAnalyzer:
         """
         logger.info("Extrayendo logros y stack del CV automáticamente...")
         prompt = EXTRACT_CV_INSIGHTS_PROMPT.format(cv_text=cv_text)
-        response = _llm(prompt)
+        response = _llm(prompt, json_mode=True)
         if response:
             data = _safe_json(response, {})
             logros_list = data.get("logros", [])
@@ -254,6 +300,7 @@ class CVFullAnalyzer:
         nivel: str = "",
         logros: str = "",
         stack: str = "",
+        progress_cb: Optional[Callable[[float, str], None]] = None,
     ) -> Dict[str, object]:
         """
         Ejecuta el análisis completo y devuelve un diccionario con los 6 entregables.
@@ -272,24 +319,90 @@ class CVFullAnalyzer:
         cv_text = _cv_to_text(cv_data)
         job_text = _job_to_text(job_data)
 
-        logger.info("Iniciando análisis completo ATS...")
+        # ── Caché de sesión: evitar re-ejecutar el mismo análisis ──
+        cache_key = hashlib.md5(
+            f"{cv_text}{job_text}{idioma}{longitud}{rol_objetivo}{nivel}".encode()
+        ).hexdigest()
+        if cache_key in self._cache:
+            logger.info("Resultado encontrado en caché (key=%s). Devolviendo instantáneamente.", cache_key[:8])
+            return {**self._cache[cache_key], "_from_cache": True}
 
-        # Auto-extraer logros y stack del CV si el usuario no los proporcionó
-        if not logros.strip() or not stack.strip():
-            logros_auto, stack_auto = self._extract_cv_insights(cv_text)
-            if not logros.strip():
-                logros = logros_auto
+        logger.info("Iniciando análisis completo ATS (ejecución paralela)...")
+
+        # Auto-extraer logros y stack directamente desde cv_data (sin LLM adicional)
+        if not logros.strip():
+            achievements = []
+            for exp in cv_data.get("experience", []):
+                for desc in (exp.get("description") or []):
+                    if isinstance(desc, str) and any(c.isdigit() or c == "%" for c in desc):
+                        achievements.append(desc.strip())
+            logros = "\n".join(f"- {a}" for a in achievements[:8]) if achievements else ""
+
+        if not stack.strip():
+            tech_skills = cv_data.get("skills", {})
+            if isinstance(tech_skills, dict):
+                tech_list = tech_skills.get("technical", [])
+                stack = ", ".join(tech_list) if tech_list else ""
+            elif isinstance(tech_skills, list):
+                stack = ", ".join(tech_skills)
+            # Fallback regex si los datos parseados están vacíos
             if not stack.strip():
-                stack = stack_auto
+                skills_match = re.search(
+                    r"SKILLS[^\n]*\n(.+?)(?=\n[A-Z]{3,}|\Z)", cv_text, re.DOTALL | re.IGNORECASE
+                )
+                if skills_match:
+                    stack = skills_match.group(1).strip()[:300]
 
+        # Build an enriched cv_text for the rewrite (D) that always includes the raw
+        # original text — this prevents the LLM from hallucinating contact details or
+        # project descriptions that weren't in the structured parse.
+        raw_text_ref = cv_data.get("raw_text", "")
+        cv_text_for_rewrite = cv_text
+        if raw_text_ref and "TEXTO COMPLETO DEL CV:" not in cv_text:
+            cv_text_for_rewrite = (
+                cv_text
+                + "\n\n---\nTEXTO ORIGINAL COMPLETO DEL CV "
+                "(referencia fiel — nombre, contacto y datos exactos provienen de aquí):\n"
+                + raw_text_ref[:3000]
+            )
+
+        # ── Ejecución secuencial con callback de progreso.
+        # LM Studio local maneja una petición a la vez en GPU; serializar
+        # da el mismo throughput que ThreadPoolExecutor(max_workers=1) pero
+        # permite emitir progreso real entre pasos.
+        def _step(frac: float, desc: str) -> None:
+            logger.info("[ATS] %s", desc)
+            if progress_cb:
+                try:
+                    progress_cb(frac, desc)
+                except Exception:  # noqa: BLE001
+                    pass  # callback de UI no debe romper el flujo
+
+        _step(0.15, "A) Diagnóstico de encaje")
         a = self._deliverable_a(cv_text, job_text, idioma, longitud, rol_objetivo, nivel)
+
+        _step(0.30, "B) Keywords ATS")
         b = self._deliverable_b(cv_text, job_text)
-        c = self._deliverable_c(cv_text, job_text, a)
-        d = self._deliverable_d(cv_text, job_text, idioma, longitud, rol_objetivo, nivel, logros, stack)
+
+        _step(0.45, "D) Reescribiendo CV")
+        contact_block = self._build_contact_block(cv_data.get("personal_info", {}))
+        d = self._deliverable_d(
+            cv_text_for_rewrite, job_text, idioma, longitud, rol_objetivo, nivel,
+            logros, stack, contact_block,
+        )
+
+        _step(0.65, "E) Variantes Resumen + Skills")
         e = self._deliverable_e(cv_text, job_text, idioma, rol_objetivo, nivel)
+
+        _step(0.80, "C) Plan de cambios")
+        c = self._deliverable_c(cv_text, job_text, a)
+
+        _step(0.92, "F) Checklist ATS final")
         f = self._deliverable_f(job_text, d)
 
-        return {
+        _step(0.98, "Empaquetando resultados")
+
+        result = {
             "A_diagnosis": a,
             "B_keywords": b,
             "C_changes": c,
@@ -297,20 +410,27 @@ class CVFullAnalyzer:
             "E_variants": e,
             "F_checklist": f,
             "llm_used": self.llm_available,
+            "_from_cache": False,
         }
+        self._cache[cache_key] = result
+        logger.info("Resultado guardado en caché (key=%s).", cache_key[:8])
+        return result
 
     # ── A) Diagnóstico de encaje ─────────────────
     def _deliverable_a(self, cv_text, job_text, idioma, longitud, rol_objetivo, nivel) -> dict:
         logger.info("Generando diagnóstico de encaje (A)...")
+        # Truncación generosa: preserva CVs largos sin exceder contexto del modelo
+        job_capped = job_text[:3000] + ("..." if len(job_text) > 3000 else "")
+        cv_capped  = cv_text[:4000]  + ("..." if len(cv_text)  > 4000 else "")
         prompt = DIAGNOSIS_PROMPT.format(
-            job_offer=job_text,
-            cv_text=cv_text,
+            job_offer=job_capped,
+            cv_text=cv_capped,
             idioma=idioma,
             longitud=longitud,
             rol_objetivo=rol_objetivo or "El indicado en la oferta",
             nivel=nivel or "No especificado",
         )
-        response = _llm(prompt, max_tokens=1500)
+        response = _llm(prompt, max_tokens=1500, json_mode=True)
         if response:
             result = _safe_json(response, {})
             if result.get("score") is not None:
@@ -319,25 +439,48 @@ class CVFullAnalyzer:
         # Fallback sin LLM
         return self._fallback_diagnosis(cv_text, job_text)
 
+    # Common stopwords to ignore when comparing job offer vs CV in fallback mode
+    _STOPWORDS: set = {
+        # Spanish
+        'para', 'como', 'este', 'esta', 'todo', 'bien', 'cada', 'poco', 'algo',
+        'desde', 'hasta', 'hace', 'bajo', 'tras', 'ante', 'entre', 'sobre', 'solo',
+        'mismo', 'otra', 'otro', 'debe', 'será', 'siendo', 'años', 'semana',
+        'puesto', 'similar', 'empresa', 'equipo', 'persona', 'trabajo', 'lugar',
+        'tipo', 'nivel', 'durante', 'dentro', 'según', 'además', 'cuando', 'donde',
+        'aunque', 'busca', 'buena', 'buenas', 'tendrás', 'podrás', 'deberás',
+        'proyecto', 'proyectos', 'tener', 'hacer', 'poder', 'haber', 'estar',
+        'tiene', 'valor', 'conocimiento', 'conocimientos',
+        # English
+        'with', 'from', 'this', 'that', 'have', 'will', 'your', 'work', 'team',
+        'role', 'skills', 'years', 'week', 'position', 'company', 'able', 'must',
+    }
+
     def _fallback_diagnosis(self, cv_text: str, job_text: str) -> dict:
         """Diagnóstico básico sin LLM basado en solapamiento de palabras."""
-        job_words = set(re.findall(r"\b\w{4,}\b", job_text.lower()))
-        cv_words = set(re.findall(r"\b\w{4,}\b", cv_text.lower()))
+        job_words = set(re.findall(r"\b\w{4,}\b", job_text.lower())) - self._STOPWORDS
+        cv_words  = set(re.findall(r"\b\w{4,}\b", cv_text.lower()))  - self._STOPWORDS
         overlap = job_words & cv_words
         score = min(100, int(len(overlap) / max(len(job_words), 1) * 200))
+        # Sort for deterministic output (sets are unordered)
+        strengths = sorted(overlap, key=lambda w: -len(w))[:5]
+        gaps = sorted(job_words - cv_words, key=lambda w: -len(w))[:5]
         return {
             "resumen_oferta": "Oferta procesada en modo básico (LM Studio no disponible). Revisión manual recomendada.",
             "score": score,
-            "razon_score": f"Score estimado basado en solapamiento de {len(overlap)} términos comunes.",
-            "fortalezas": [{"fortaleza": f"Término común: {w}", "cita_cv": w} for w in list(overlap)[:5]],
-            "gaps": [{"gap": f"Término de la oferta no encontrado: {w}", "impacto": "alto"} for w in list(job_words - cv_words)[:5]],
+            "razon_score": f"Score estimado basado en solapamiento de {len(overlap)} términos relevantes.",
+            "fortalezas": [{"fortaleza": f"Coincidencia detectada: {w}", "cita_cv": w} for w in strengths],
+            "gaps": [{"gap": f"Término requerido no encontrado en CV: {w}", "impacto": "alto"} for w in gaps],
         }
 
     # ── B) Keywords ATS ──────────────────────────
     def _deliverable_b(self, cv_text: str, job_text: str) -> dict:
         logger.info("Extrayendo keywords ATS (B)...")
-        prompt = KEYWORDS_PROMPT.format(job_offer=job_text, cv_text=cv_text)
-        response = _llm(prompt, max_tokens=2000)
+        job_capped = job_text[:3000] + ("..." if len(job_text) > 3000 else "")
+        cv_capped  = cv_text[:4000]  + ("..." if len(cv_text)  > 4000 else "")
+        prompt = KEYWORDS_PROMPT.format(job_offer=job_capped, cv_text=cv_capped)
+        # 20-40 keywords × ~80-100 tokens/u (5 campos) → 2000-2800 tokens.
+        # Con 1200 el JSON se truncaba y caía al fallback regex.
+        response = _llm(prompt, max_tokens=3000, json_mode=True)
         if response:
             result = _safe_json(response, {})
             if result.get("keywords"):
@@ -370,12 +513,16 @@ class CVFullAnalyzer:
             f"Score: {diagnosis.get('score', 'N/A')}/100. "
             f"Gaps principales: {', '.join(g['gap'] for g in diagnosis.get('gaps', [])[:3])}"
         )
+        job_capped = job_text[:3000] + ("..." if len(job_text) > 3000 else "")
+        cv_capped  = cv_text[:4000]  + ("..." if len(cv_text)  > 4000 else "")
         prompt = CHANGES_PROMPT.format(
-            job_offer=job_text,
-            cv_text=cv_text,
+            job_offer=job_capped,
+            cv_text=cv_capped,
             diagnosis_summary=diagnosis_summary,
         )
-        response = _llm(prompt, max_tokens=1500)
+        # 8-15 cambios × 5 campos × ~120 tokens/u → hasta 1800 tokens.
+        # Con 1500 el JSON se truncaba y caía al fallback regex.
+        response = _llm(prompt, max_tokens=3000, json_mode=True)
         if response:
             result = _safe_json(response, {})
             if result.get("cambios"):
@@ -412,6 +559,32 @@ class CVFullAnalyzer:
         return {"cambios": cambios}
 
     # ── D) CV reescrito ──────────────────────────
+    @staticmethod
+    def _build_contact_block(personal_info: dict) -> str:
+        """Construye el bloque de contacto explícito para el prompt D.
+
+        Cada línea sigue el formato 'Campo: valor' o 'Campo: (no disponible)'.
+        El LLM tiene instrucción de omitir las líneas marcadas como no
+        disponibles, lo que evita que invente valores o use marcadores tipo
+        [Tu teléfono]. Garantiza una fuente de verdad única para el contacto.
+        """
+        pi = personal_info or {}
+
+        def _v(key: str) -> str:
+            val = pi.get(key)
+            if not val or not str(val).strip():
+                return "(no disponible)"
+            return str(val).strip()
+
+        return (
+            f"- Nombre: {_v('name')}\n"
+            f"- Email: {_v('email')}\n"
+            f"- Teléfono: {_v('phone')}\n"
+            f"- Ubicación: {_v('location')}\n"
+            f"- LinkedIn: {_v('linkedin')}\n"
+            f"- GitHub: {_v('github')}"
+        )
+
     def _deliverable_d(
         self,
         cv_text: str,
@@ -422,11 +595,13 @@ class CVFullAnalyzer:
         nivel: str,
         logros: str,
         stack: str,
+        contact_block: str,
     ) -> str:
         logger.info("Reescribiendo CV (D)...")
         prompt = CV_REWRITE_PROMPT.format(
             job_offer=job_text,
             cv_text=cv_text,
+            contact_block=contact_block,
             idioma=idioma,
             longitud=longitud,
             rol_objetivo=rol_objetivo or "El indicado en la oferta",
@@ -434,7 +609,15 @@ class CVFullAnalyzer:
             logros=logros or "Extraer del CV original",
             stack=stack or "Extraer del CV original",
         )
-        response = _llm(prompt, max_tokens=3000)
+        response = _llm(prompt, max_tokens=3000, temperature=0.2)
+        # Guarda anti-deriva: modelos tipo Qwen a veces intercalan caracteres
+        # CJK en mitad del texto. Si el idioma objetivo no es asiático y
+        # aparecen, reintentamos una vez con temperatura mínima.
+        if response and _has_cjk(response) and idioma.upper() not in ("ZH", "JA", "KO"):
+            logger.warning("CV reescrito con caracteres CJK inesperados; reintentando a temperatura mínima.")
+            retry = _llm(prompt, max_tokens=3000, temperature=0.05)
+            if retry and not _has_cjk(retry):
+                response = retry
         if response and len(response.strip()) > 200:
             return self._clean_cv_output(response.strip())
 
@@ -451,14 +634,46 @@ class CVFullAnalyzer:
         )
 
     # ── Limpieza de salida del CV ────────────────
+    # Known placeholder words the LLM inserts when a field is missing.
+    _PLACEHOLDER_RE = re.compile(
+        r"\[\s*(?:"
+        r"n[úu]mero\s+de\s+tel[eé]fono"
+        r"|tel[eé]fono"
+        r"|phone"
+        r"|linkedin(?:[^\]]{0,40})?"
+        r"|github(?:[^\]]{0,40})?"
+        r"|portfolio(?:[^\]]{0,40})?"
+        r"|url(?:[^\]]{0,20})?"
+        r"|correo(?:[^\]]{0,30})?"
+        r"|e-?mail(?:[^\]]{0,30})?"
+        r"|insertar(?:[^\]]{0,40})?"
+        r"|tu\s+\w+"
+        r"|nombre(?:[^\]]{0,30})?"
+        r")\s*\]"
+        r"|"
+        # Also strip any "Label: [placeholder]" pattern where the bracket value
+        # has 3-50 chars and looks like a template token (starts with capital or
+        # contains common placeholder words)
+        r"(?:(?:tel[eé]fono|phone|linkedin|github|portfolio|url|correo|e-?mail)"
+        r"\s*:\s*\[[^\]]{3,60}\])",
+        re.IGNORECASE,
+    )
+
     @staticmethod
     def _clean_cv_output(text: str) -> str:
         """
         Elimina artefactos que el LLM añade al CV pero no forman parte de él:
+        - Placeholders de campos no disponibles: [Número de teléfono], [LinkedIn], etc.
         - Líneas con marcadores [PREGUNTA: ...]
         - Secciones de notas/comentarios/observaciones (### Notas adicionales, etc.)
         - Líneas de meta-comentario ('Este CV está optimizado...', etc.)
         """
+        # ── Strip placeholder brackets before splitting into lines ──
+        text = CVFullAnalyzer._PLACEHOLDER_RE.sub("", text)
+        # Clean up orphaned separators left after placeholder removal (e.g. " · · ")
+        text = re.sub(r"(?:\s*·\s*){2,}", " · ", text)  # collapse multiple " · "
+        text = re.sub(r"^\s*[·\-]\s*$", "", text, flags=re.MULTILINE)  # lone separator lines
+
         lines = text.split("\n")
         cleaned = []
         skip_section = False
@@ -510,7 +725,7 @@ class CVFullAnalyzer:
             rol_objetivo=rol_objetivo or "El indicado en la oferta",
             nivel=nivel or "No especificado",
         )
-        response = _llm(prompt, max_tokens=3500)
+        response = _llm(prompt, max_tokens=1500, json_mode=True)  # reducido de 3500: salida real ~600-900 tokens
         if response:
             result = _safe_json(response, {})
             if result.get("ats_first") and result.get("recruiter_first"):
@@ -537,7 +752,7 @@ class CVFullAnalyzer:
             job_offer_summary=job_summary,
             cv_adapted=cv_preview,
         )
-        response = _llm(prompt, max_tokens=1200)
+        response = _llm(prompt, max_tokens=2500, json_mode=True)  # 12-15 items × ~80 tokens ≈ 1200 base; +margen para detalles largos
         if response:
             result = _safe_json(response, {})
             if result.get("checklist"):

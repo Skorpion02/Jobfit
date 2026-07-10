@@ -186,8 +186,12 @@ CV_REWRITE_PROMPT = """Reescribe el CV adaptado a la oferta en texto plano, list
 OFERTA:
 {job_offer}
 
-CV ORIGINAL:
+CV ORIGINAL (fuente de verdad — usa ÚNICAMENTE los datos que aparecen aquí):
 {cv_text}
+
+DATOS DE CONTACTO DEL CANDIDATO (úsalos exactamente como aparecen; OMITE las líneas que
+estén vacías o marcadas como "(no disponible)" — NO inventes valores ni añadas corchetes):
+{contact_block}
 
 Preferencias:
 - Idioma: {idioma}
@@ -197,25 +201,47 @@ Preferencias:
 - Logros medibles que el candidato puede defender: {logros}
 - Stack/herramientas reales que usa: {stack}
 
-Estructura del CV (en el idioma indicado). Usa los títulos de sección exactamente como se indican,
-NO uses palabras genéricas como "Encabezado" ni "Header":
-1. [Nombre completo — sin etiqueta de sección]
-   [Ciudad/País · Tel · Email · LinkedIn · GitHub/Portfolio]
-2. PERFIL PROFESIONAL  (o PROFESSIONAL SUMMARY si el idioma es inglés)
-3. HABILIDADES  (o SKILLS)
-4. EXPERIENCIA PROFESIONAL  (o PROFESSIONAL EXPERIENCE)
-5. PROYECTOS  (solo si aportan valor al encaje; omitir si no hay)
-6. EDUCACIÓN  (o EDUCATION)
-7. IDIOMAS  (o LANGUAGES)
+Estructura del CV (en el idioma indicado):
+1. Nombre completo en la primera línea (sin etiqueta de sección, sin "Nombre:", sin
+   "Línea de contacto:" ni ninguna otra etiqueta literal — solo el nombre tal cual)
+2. Una sola línea con los datos de contacto disponibles separados por " · " (ej.
+   "email · teléfono · ubicación · LinkedIn · GitHub"). NO antepongas etiquetas como
+   "Email:" o "Teléfono:" salvo que el CV original las use; ofrece los valores limpios.
+3. PERFIL PROFESIONAL  (o PROFESSIONAL SUMMARY si el idioma es inglés)
+4. HABILIDADES  (o SKILLS)
+5. EXPERIENCIA PROFESIONAL  (o PROFESSIONAL EXPERIENCE)
+6. PROYECTOS  (solo si aportan valor al encaje; omitir si no hay)
+7. EDUCACIÓN  (o EDUCATION)
+8. IDIOMAS  (o LANGUAGES)
 
-Reglas importantes:
-- NO inventes métricas, herramientas ni logros que no estén en el CV original.
-- Si falta algún dato (ej. email), simplemente omítelo; no pongas marcadores ni preguntas.
-- Texto plano: sin emojis, tablas, iconos ni columnas.
-- Verbos de acción al inicio de cada bullet de experiencia.
-- Máximo {longitud}.
-- GENERA ÚNICAMENTE EL CV. Sin notas finales, comentarios sobre el proceso, preguntas entre
-  corchetes, secciones "Notas adicionales", ni ningún texto que no forme parte del CV.
+REGLAS CRÍTICAS — incumplirlas invalida el resultado:
+
+1. NOMBRE: Copia el nombre del candidato EXACTAMENTE como aparece en el CV. No lo cambies,
+   no lo abrevies ni lo modifiques.
+
+2. CONTACTO: Usa los valores del bloque "DATOS DE CONTACTO DEL CANDIDATO" tal cual. Si un
+   campo aparece como "(no disponible)" o vacío, OMÍTELO por completo (no pongas la
+   etiqueta, no pongas marcadores, no pongas corchetes, no inventes el dato).
+   PROHIBIDO usar plantillas tipo [Tu teléfono], [LinkedIn], [GitHub/URL], [Insertar aquí].
+
+3. EXPERIENCIA Y PROYECTOS: Reescribe usando ÚNICAMENTE los hechos del CV original.
+   Puedes mejorar la redacción y el orden, pero NUNCA añadas empresas, roles, tecnologías,
+   métricas, proyectos ni logros que no estén en el texto original.
+
+4. EDUCACIÓN: Copia institución, título y fechas tal cual aparecen en el CV. NO añadas
+   ciudades, países, especialidades ni notas que el CV no mencione explícitamente. Si
+   "IMMUNE" no tiene ciudad en el CV original, NO escribas "IMMUNE · Madrid".
+
+5. NO inventes ni inferas ningún dato que no esté explícitamente en el CV original.
+
+6. Texto plano: sin emojis, tablas, iconos ni columnas.
+
+7. Verbos de acción al inicio de cada bullet de experiencia.
+
+8. Máximo {longitud}.
+
+9. GENERA ÚNICAMENTE EL CV. Sin notas, comentarios, preguntas entre corchetes ni texto
+   que no forme parte del CV.
 """
 
 # ── E) Variantes Resumen + Skills ─────────────

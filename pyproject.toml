@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jobfit-agent"
+version = "1.0.0"
+description = "Adapta tu CV a cualquier oferta de trabajo con IA local 100 % privada (LM Studio + Gradio)."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "Skorpion02" }]
+keywords = ["cv", "ats", "lm-studio", "gradio", "llm", "career"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business",
+    "Topic :: Text Processing",
+]
+
+# Dependencias de runtime. Mantener sincronizadas con requirements.txt
+# (requirements.txt sigue siendo útil para `pip install -r` y para Docker).
+dependencies = [
+    "gradio>=4.4.0",
+    "sentence-transformers>=3.0.0",
+    "scikit-learn>=1.3.0",
+    "numpy>=1.24.0",
+    "torch>=2.0.0",
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "python-docx>=1.1.0",
+    "PyPDF2>=3.0.0",
+    "pdfplumber>=0.10.0",
+    "pymupdf>=1.24.0",
+    "pdf2image>=1.17.0",
+    "openai>=1.0.0",
+    "pydantic>=2.4.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+ocr = ["easyocr>=1.7.0"]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+# `pip install -e .` deja disponible el binario `jobfit` apuntando a main:main
+jobfit = "main:main"
+
+[project.urls]
+Homepage = "https://github.com/Skorpion02/JobFit"
+Issues = "https://github.com/Skorpion02/JobFit/issues"
+
+# ── Layout: paquetes en la raíz (no src-layout estricto), por compatibilidad
+# con los imports actuales `from src.X.Y import Z` y `from config.W import …`.
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "config*", "interface*"]
+exclude = ["tests*", "docs*", "scripts*", "notebooks*", "venv*", "docker*"]
+
+# ── Tooling de calidad ─────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["venv", "notebooks", "data", "exports", "logs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",  # line-too-long manejada por el formateador
+    "B008",  # gr.Progress() como default arg es idiomático en Gradio
+]

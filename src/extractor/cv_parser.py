@@ -1,12 +1,33 @@
 from docx import Document
 import PyPDF2
 import pdfplumber
+from pathlib import Path
 from typing import Dict, List, Optional
+import os
 import re
 import json
+import logging
+
+from config.settings import settings
+
+# Optional fast PDF engine (PyMuPDF) — gracefully disabled if not installed
+try:
+    import fitz as _fitz  # noqa: F401
+    _PYMUPDF_AVAILABLE = True
+except ImportError:
+    _PYMUPDF_AVAILABLE = False
+
+# PDF processing constants
+_PDF_SCANNED_CHAR_THRESHOLD = 100   # avg non-whitespace chars/page; below this → scanned PDF
+_PDF_OCR_DPI = 200                   # DPI for rasterising pages before OCR
+_PDF_HEADER_FOOTER_MARGIN = 0.08     # fraction of page height stripped from top & bottom
+
+logger = logging.getLogger(__name__)
+
 
 class CVParser:
     def __init__(self):
+        self._ocr_reader = None  # Lazy-loaded on first encounter of a scanned PDF
         self.sections = {
             'experience': ['experiencia', 'experience', 'trabajo', 'work', 'employment', 
                           'professional', 'laboral', 'trayectoria', 'historial'],
@@ -19,6 +40,10 @@ class CVParser:
     
     def parse_cv(self, file_path: str, file_type: str) -> Dict:
         """Parsea CV según el tipo de archivo"""
+        # Guard de tamaño máximo: protege contra PDFs/DOCX gigantes que
+        # podrían agotar RAM al ser parseados por PyMuPDF/pdfplumber/easyocr.
+        self._enforce_size_limit(file_path)
+
         if file_type.lower() == 'pdf':
             text = self._extract_pdf_text(file_path)
         elif file_type.lower() in ['docx', 'doc']:
@@ -28,44 +53,271 @@ class CVParser:
                 text = f.read()
         else:
             raise ValueError(f"Tipo de archivo no soportado: {file_type}")
-        
+
         return self._structure_cv_content(text)
+
+    @staticmethod
+    def _enforce_size_limit(file_path: str) -> None:
+        """Rechaza el archivo si supera MAX_CV_SIZE_MB."""
+        try:
+            size_bytes = os.path.getsize(file_path)
+        except OSError as exc:
+            raise ValueError(f"No se pudo acceder al archivo: {exc}") from exc
+
+        max_bytes = settings.max_cv_size_mb * 1024 * 1024
+        if size_bytes > max_bytes:
+            raise ValueError(
+                f"CV demasiado grande: {size_bytes / (1024*1024):.1f} MB "
+                f"(máximo {settings.max_cv_size_mb} MB). "
+                f"Reduce el archivo o ajusta MAX_CV_SIZE_MB en .env."
+            )
     
     def _extract_pdf_text(self, file_path: str) -> str:
-        """Extrae texto de un PDF y limpia el formato"""
-        text = ""
-        try:
-            # Intentar primero con pdfplumber (mejor para layouts complejos)
-            with pdfplumber.open(file_path) as pdf:
-                for page in pdf.pages:
-                    # Usar extract_text simple - funciona mejor para layouts complejos
-                    page_text = page.extract_text(layout=False)
-                    if page_text:
-                        text += page_text + "\n"
-            
-            # Si pdfplumber no funciona, usar PyPDF2 como fallback
+        """Orchestrates PDF text extraction.
+
+        Detects whether the PDF is scanned (image-based) or native (text-based)
+        and routes to the appropriate pipeline. The result is cleaned and ready
+        for _structure_cv_content().
+        """
+        if self._is_scanned_pdf(file_path):
+            logger.info("[CVParser] PDF escaneado detectado — activando pipeline OCR")
+            text = self._extract_ocr_text(file_path)
             if not text.strip():
-                with open(file_path, 'rb') as file:
-                    pdf_reader = PyPDF2.PdfReader(file)
-                    for page in pdf_reader.pages:
-                        page_text = page.extract_text()
-                        text += page_text + "\n"
-            
-            # Limpiar y normalizar el texto
-            text = self._clean_pdf_text(text)
+                logger.warning("[CVParser] OCR sin resultado — usando extracción nativa como respaldo")
+                text = self._extract_native_pdf_text(file_path)
+        else:
+            text = self._extract_native_pdf_text(file_path)
+        return self._clean_pdf_text(text)
+
+    # ------------------------------------------------------------------
+    # Scanned PDF detection
+    # ------------------------------------------------------------------
+
+    def _is_scanned_pdf(self, file_path: str) -> bool:
+        """Returns True if the PDF appears to be scanned (image-only pages).
+
+        Samples the first three pages and computes the average number of
+        non-whitespace characters.  A very low count (<100) indicates that
+        the pages contain images rather than selectable text.
+        """
+        pages_to_check = 3
+        total_chars = 0
+        checked = 0
+        try:
+            if _PYMUPDF_AVAILABLE:
+                import fitz
+                doc = fitz.open(file_path)
+                checked = min(pages_to_check, len(doc))
+                for i in range(checked):
+                    total_chars += len(re.sub(r'\s', '', doc[i].get_text()))
+                doc.close()
+            else:
+                with pdfplumber.open(file_path) as pdf:
+                    checked = min(pages_to_check, len(pdf.pages))
+                    for page in pdf.pages[:checked]:
+                        total_chars += len(re.sub(r'\s', '', page.extract_text() or ""))
         except Exception as e:
-            print(f"Error extrayendo PDF con pdfplumber: {e}")
-            # Fallback a PyPDF2
+            logger.warning(f"[CVParser] No se pudo verificar si el PDF es escaneado: {e}")
+            return False
+        avg = total_chars / checked if checked else 0
+        return avg < _PDF_SCANNED_CHAR_THRESHOLD
+
+    # ------------------------------------------------------------------
+    # Native (text-based) PDF extraction
+    # ------------------------------------------------------------------
+
+    def _extract_native_pdf_text(self, file_path: str) -> str:
+        """Extracts text from a text-based PDF.
+
+        Resolution order:
+          1. PyMuPDF  — fastest, column-aware, strips header/footer by position.
+          2. pdfplumber — better for pages that contain tables.
+          3. PyPDF2   — last resort for simple single-column PDFs.
+        """
+        text = ""
+
+        # --- 1. PyMuPDF ---
+        if _PYMUPDF_AVAILABLE:
             try:
-                with open(file_path, 'rb') as file:
-                    pdf_reader = PyPDF2.PdfReader(file)
-                    for page in pdf_reader.pages:
-                        text += page.extract_text() + "\n"
-                text = self._clean_pdf_text(text)
-            except Exception as e2:
-                print(f"Error con PyPDF2: {e2}")
+                import fitz
+                doc = fitz.open(file_path)
+                page_texts = []
+                for page_num, page in enumerate(doc):
+                    h = page.rect.height
+                    # Page 1 header = candidate name/contact — never a running header,
+                    # so don't crop it. On page 2+ crop the repeated-header zone.
+                    header_y = h * _PDF_HEADER_FOOTER_MARGIN if page_num > 0 else 0
+                    footer_y = h * (1 - _PDF_HEADER_FOOTER_MARGIN)
+                    # block[6] == 0 → text block; filter blocks inside header/footer
+                    text_blocks = [
+                        (b[0], b[1], b[2], b[3], b[4])
+                        for b in page.get_text("blocks")
+                        if b[6] == 0 and b[1] > header_y and b[3] < footer_y
+                    ]
+                    page_texts.append(
+                        self._blocks_to_ordered_text(text_blocks, page.rect.width)
+                    )
+                doc.close()
+                text = "\n".join(page_texts)
+            except Exception as e:
+                logger.warning(f"[CVParser] pymupdf falló: {e}")
+                text = ""
+
+        # --- 2. pdfplumber — preferred for pages with tables ---
+        if not text.strip():
+            try:
+                with pdfplumber.open(file_path) as pdf:
+                    page_texts = []
+                    for page in pdf.pages:
+                        h = page.height
+                        cropped = page.crop((
+                            0,
+                            h * _PDF_HEADER_FOOTER_MARGIN,
+                            page.width,
+                            h * (1 - _PDF_HEADER_FOOTER_MARGIN),
+                        ))
+                        if cropped.find_tables():
+                            page_texts.append(self._extract_page_with_tables(cropped))
+                        else:
+                            page_texts.append(cropped.extract_text(layout=False) or "")
+                    text = "\n".join(page_texts)
+            except Exception as e:
+                logger.warning(f"[CVParser] pdfplumber falló: {e}")
+
+        # --- 3. PyPDF2 — last resort ---
+        if not text.strip():
+            try:
+                with open(file_path, 'rb') as f:
+                    reader = PyPDF2.PdfReader(f)
+                    text = "\n".join(
+                        (p.extract_text() or "") for p in reader.pages
+                    )
+            except Exception as e:
+                logger.error(f"[CVParser] PyPDF2 falló: {e}")
+
         return text
-    
+
+    # Words that indicate a line is a job title/subtitle, not a person's name.
+    _JOB_TITLE_WORDS = {
+        'analyst', 'analista', 'developer', 'desarrollador', 'engineer', 'ingeniero',
+        'programmer', 'programador', 'manager', 'director', 'coordinator', 'coordinador',
+        'specialist', 'especialista', 'consultant', 'consultor', 'technician', 'técnico',
+        'designer', 'diseñador', 'architect', 'arquitecto', 'scientist', 'científico',
+    }
+
+    def _blocks_to_ordered_text(self, blocks: list, page_width: float) -> str:
+        """Orders pymupdf text blocks for correct reading order.
+
+        Detects two-column layouts by checking whether there are substantial
+        groups of blocks anchored on both the left and right halves of the
+        page.  When two columns are found each is sorted top-to-bottom
+        independently and the left column is emitted first.
+
+        Special case: blocks that appear above the top-most left-column block
+        are treated as a full-width header (where the candidate's name and
+        job title usually live in Canva/designer templates) and emitted
+        before either column so the name appears as the very first text.
+        """
+        if not blocks:
+            return ""
+        # Classify by x0 (left edge): blocks starting past 45 % are "right column"
+        threshold = page_width * 0.45
+        left_col = [b for b in blocks if b[0] < threshold and b[4].strip()]
+        right_col = [b for b in blocks if b[0] >= threshold and b[4].strip()]
+
+        if len(left_col) >= 3 and len(right_col) >= 2:
+            # Two-column layout — but first extract any header blocks that live
+            # above where the left column starts (e.g. name/title in a Canva CV).
+            left_min_y = min(b[1] for b in left_col)
+            header = [b for b in right_col if b[1] < left_min_y]
+            body_r = [b for b in right_col if b[1] >= left_min_y]
+
+            header_text = "\n".join(
+                b[4].strip() for b in sorted(header, key=lambda b: b[1])
+            )
+            left_text = "\n".join(
+                b[4].strip() for b in sorted(left_col, key=lambda b: b[1])
+            )
+            right_text = "\n".join(
+                b[4].strip() for b in sorted(body_r, key=lambda b: b[1])
+            )
+            return "\n".join(p for p in [header_text, left_text, right_text] if p)
+        # Single column: top-to-bottom, left-to-right
+        return "\n".join(
+            b[4].strip()
+            for b in sorted(blocks, key=lambda b: (b[1], b[0]))
+            if b[4].strip()
+        )
+
+    def _extract_page_with_tables(self, page) -> str:
+        """Extracts text from a pdfplumber page that contains tables.
+
+        Tables are rendered as pipe-delimited rows so the downstream LLM
+        can interpret the structure.  The plain page text is emitted first
+        to preserve any surrounding prose.
+        """
+        parts = [page.extract_text(layout=False) or ""]
+        for table in page.find_tables():
+            data = table.extract()
+            if not data:
+                continue
+            rows = []
+            for row in data:
+                cells = [str(cell).strip() if cell is not None else "" for cell in row]
+                rows.append(" | ".join(cells))
+            parts.append("\n".join(rows))
+        return "\n".join(p for p in parts if p.strip())
+
+    # ------------------------------------------------------------------
+    # OCR pipeline (scanned PDFs)
+    # ------------------------------------------------------------------
+
+    def _get_ocr_reader(self):
+        """Lazy-loads EasyOCR reader (cached after first call).
+
+        Returns None if easyocr is not installed so that callers can
+        gracefully skip OCR rather than crashing.
+        """
+        if self._ocr_reader is None:
+            try:
+                import easyocr
+                logger.info("[CVParser] Cargando EasyOCR (primera vez, puede tardar unos segundos)…")
+                self._ocr_reader = easyocr.Reader(['es', 'en'], verbose=False)
+            except ImportError:
+                logger.warning(
+                    "[CVParser] easyocr no instalado — OCR no disponible. "
+                    "Instala con: pip install easyocr pdf2image"
+                )
+        return self._ocr_reader
+
+    def _extract_ocr_text(self, file_path: str) -> str:
+        """Extracts text from a scanned PDF using pdf2image + EasyOCR.
+
+        Each page is rasterised at _PDF_OCR_DPI and passed to EasyOCR.
+        Results are ordered by EasyOCR's paragraph grouping which already
+        handles reading order.
+        """
+        text_parts: List[str] = []
+        try:
+            from pdf2image import convert_from_path
+            import numpy as np
+
+            reader = self._get_ocr_reader()
+            if reader is None:
+                return ""
+
+            logger.info("[CVParser] Rasterizando páginas para OCR…")
+            images = convert_from_path(file_path, dpi=_PDF_OCR_DPI)
+            for idx, img in enumerate(images):
+                results = reader.readtext(np.array(img), detail=0, paragraph=True)
+                text_parts.append("\n".join(str(r) for r in results))
+                logger.debug(f"[CVParser] OCR página {idx + 1}/{len(images)} completada")
+        except ImportError as e:
+            logger.warning(f"[CVParser] Dependencias OCR no instaladas ({e})")
+        except Exception as e:
+            logger.error(f"[CVParser] Error en OCR: {e}")
+        return "\n".join(text_parts)
+
     def _extract_text_with_columns(self, words: list, page_width: float) -> str:
         """Extrae texto respetando columnas del PDF"""
         if not words:
@@ -563,6 +815,52 @@ class CVParser:
         
         return projects
     
+    @staticmethod
+    def _extract_linkedin(text: str) -> Optional[str]:
+        """Detecta URL completa o handle de LinkedIn en el texto."""
+        # URL completa: https://(www.|es.|...)linkedin.com/in/<slug>
+        url_match = re.search(
+            r'(?:https?://)?(?:[a-z]{2,3}\.)?linkedin\.com/(?:in|pub)/[A-Za-z0-9\-_%/.]+',
+            text, re.IGNORECASE,
+        )
+        if url_match:
+            url = url_match.group(0).rstrip('/.,;:)')
+            if not url.lower().startswith('http'):
+                url = 'https://' + url
+            return url
+        # Etiqueta "LinkedIn: <handle>" → handle libre (no URL)
+        label_match = re.search(
+            r'LinkedIn[:\s]+([A-Za-zÁ-Úá-ú0-9][\w\sÁ-Úá-úñÑ\-]{2,60})',
+            text,
+        )
+        if label_match:
+            handle = label_match.group(1).strip().rstrip('.,;:)')
+            # Evitar capturar la siguiente sección si la línea no termina antes
+            handle = re.split(r'\s{2,}|[\n\r]', handle)[0].strip()
+            if handle and len(handle) >= 3:
+                return handle
+        return None
+
+    @staticmethod
+    def _extract_github(text: str) -> Optional[str]:
+        """Detecta URL completa o handle de GitHub en el texto."""
+        url_match = re.search(
+            r'(?:https?://)?(?:www\.)?github\.com/[A-Za-z0-9\-_.]+',
+            text, re.IGNORECASE,
+        )
+        if url_match:
+            url = url_match.group(0).rstrip('/.,;:)')
+            if not url.lower().startswith('http'):
+                url = 'https://' + url
+            return url
+        label_match = re.search(
+            r'GitHub[:\s]+([A-Za-z0-9\-_./]{2,60})',
+            text,
+        )
+        if label_match:
+            return label_match.group(1).strip().rstrip('.,;:)')
+        return None
+
     def _extract_personal_info(self, lines: List[str], full_raw_text: str = None) -> Dict:
         """Extrae información personal del inicio del CV"""
         info = {}
@@ -574,6 +872,16 @@ class CVParser:
         email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', full_text)
         if email_match:
             info['email'] = email_match.group()
+
+        # Buscar LinkedIn (URL completa o handle tras "LinkedIn:")
+        linkedin = self._extract_linkedin(full_text)
+        if linkedin:
+            info['linkedin'] = linkedin
+
+        # Buscar GitHub (URL completa o handle tras "GitHub:")
+        github = self._extract_github(full_text)
+        if github:
+            info['github'] = github
         
         # Buscar teléfono: primero por etiqueta (más fiable), luego por patrón
         labeled_phone = re.search(
@@ -600,8 +908,10 @@ class CVParser:
                     info['phone'] = phone_match.group().strip()
                     break
         
-        # Buscar nombre (líneas con mayúsculas y formato de nombre)
-        for i, line in enumerate(lines[:25]):
+        # Buscar nombre (líneas con mayúsculas y formato de nombre).
+        # We search the first 40 lines to handle two-column PDFs where the
+        # name block may be preceded by a header/subtitle extracted first.
+        for i, line in enumerate(lines[:40]):
             line = line.strip()
             # Nombre suele tener mayúsculas y 2-4 palabras
             if 'name' not in info and 5 < len(line) < 60:
@@ -609,15 +919,33 @@ class CVParser:
                 if len(words) >= 2 and any(w[0].isupper() for w in words if w):
                     # Verificar que no sea email, teléfono u otra cosa
                     if '@' not in line and not re.search(r'\d{3}', line):
+                        # Skip lines that look like job titles or section headers
+                        lower_words = {w.lower() for w in words}
+                        if lower_words & CVParser._JOB_TITLE_WORDS:
+                            continue
+                        # Skip common CV section headers (all-caps multi-word lines
+                        # that contain typical section keywords)
+                        section_kw = {
+                            'perfil', 'profesional', 'experiencia', 'habilidades',
+                            'educacion', 'educación', 'idiomas', 'contacto',
+                            'skills', 'experience', 'education', 'profile',
+                            'resumen', 'logros', 'proyectos', 'certificaciones',
+                        }
+                        if lower_words & section_kw:
+                            continue
                         # Si el nombre parece incompleto, buscar en la siguiente línea
                         if len(words) == 2 and i < len(lines) - 1:
                             next_line = lines[i + 1].strip()
                             next_words = next_line.split()
-                            # Si la siguiente línea tiene 1-2 palabras con mayúsculas, probablemente es parte del nombre
-                            if len(next_words) <= 2 and next_words and next_words[0][0].isupper():
-                                if '@' not in next_line and not re.search(r'\d{3}', next_line):
-                                    info['name'] = line + ' ' + next_line
-                                    break
+                            # Si la siguiente línea tiene 1-2 palabras con mayúsculas,
+                            # probablemente es parte del nombre
+                            if (len(next_words) <= 2 and next_words
+                                    and next_words[0][0].isupper()
+                                    and '@' not in next_line
+                                    and not re.search(r'\d{3}', next_line)
+                                    and not {w.lower() for w in next_words} & section_kw):
+                                info['name'] = line + ' ' + next_line
+                                break
                         info['name'] = line
                         break
         

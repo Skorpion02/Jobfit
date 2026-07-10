@@ -1,0 +1,52 @@
+# JobFit — variante CPU-only (sin GPU/CUDA). Fallback para maquinas sin GPU NVIDIA
+# o sin nvidia-container-toolkit. Imagen mas pequena; los embeddings y el OCR corren en CPU.
+# Para GPU usar el Dockerfile principal + docker-compose.yml.
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/app/.cache/huggingface \
+    EASYOCR_MODULE_PATH=/app/.cache/easyocr
+
+# Dependencias de sistema:
+#   poppler-utils -> pdf2image (convert_from_path) en la ruta OCR
+#   libgl1 / libglib2.0-0 -> opencv (dependencia de easyocr)
+#   curl -> HEALTHCHECK
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        poppler-utils libgl1 libglib2.0-0 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# torch + torchvision build CPU (wheel mucho mas ligera, sin librerias CUDA).
+# Se incluye torchvision para que easyocr no reinstale torch desde PyPI.
+RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# Resto de dependencias (incluye OCR: easyocr + pdf2image).
+# El Dockerfile vive en docker/, pero el build context se invoca desde la raíz del
+# repo (ver docker-compose.cpu.yml), así que la ruta es docker/requirements.txt.
+COPY docker/requirements.txt ./requirements.docker.txt
+RUN pip install -r requirements.docker.txt
+
+# Pre-descarga de modelos para que el primer arranque no necesite red:
+#   - embeddings all-MiniLM-L6-v2 (sentence-transformers / HuggingFace)
+#   - modelos de deteccion+reconocimiento de easyocr (es, en)
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')" \
+ && python -c "import easyocr; easyocr.Reader(['es', 'en'])"
+
+# Codigo de la aplicacion (.dockerignore excluye venv, .env, caches, etc.)
+COPY . .
+
+# Usuario no-root + directorios escribibles en runtime
+RUN useradd -m appuser \
+ && mkdir -p logs exports data/temp data/templates data/examples \
+ && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 7860
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD curl -fsS http://localhost:7860/ || exit 1
+
+CMD ["python", "main.py", "--host", "0.0.0.0", "--port", "7860"]

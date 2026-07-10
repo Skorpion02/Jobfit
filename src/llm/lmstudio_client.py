@@ -7,12 +7,17 @@ from config.settings import settings
 
 class LMStudioClient:
     """Cliente para interactuar con LM Studio local"""
-    
+
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.base_url = settings.lmstudio_base_url
         self.model = settings.lmstudio_model
         self.client = None
+        # Modo de salida estructurada negociado con el servidor en el primer
+        # intento (None = aún no determinado). LM Studio >=0.3.x exige
+        # json_schema; otros servidores OpenAI-compat aceptan json_object;
+        # algunos, ninguno. Recordarlo evita renegociar en cada llamada.
+        self._struct_mode = None
         self.available = self._check_availability()
     
     def _check_availability(self) -> bool:
@@ -79,43 +84,121 @@ class LMStudioClient:
             self.logger.error("="*60)
             return False
     
-    def chat_completion(self, prompt: str, system_message: str = None, temperature: float = 0.1, max_tokens: int = 2000) -> Optional[str]:
-        """Realiza una consulta a LM Studio"""
+    # Orden de preferencia para forzar salida JSON. LM Studio >=0.3.x exige
+    # json_schema; otros servidores OpenAI-compat aceptan json_object; algunos
+    # no aceptan ninguno y hay que caer a texto libre.
+    _STRUCT_LADDER = ("json_schema", "json_object", "free")
+
+    @staticmethod
+    def _structured_format(mode: str):
+        """Devuelve el response_format para el modo dado (None = texto libre)."""
+        if mode == "json_schema":
+            # Esquema genérico: obliga a un objeto JSON válido sin fijar los
+            # campos. Evita la deriva del modelo a texto/otro idioma a mitad de
+            # la respuesta, manteniendo flexibilidad para cualquier prompt.
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response",
+                    "strict": False,
+                    "schema": {"type": "object"},
+                },
+            }
+        if mode == "json_object":
+            return {"type": "json_object"}
+        return None  # "free"
+
+    def _create_structured(self, base_kwargs: dict):
+        """Crea una respuesta forzando JSON, probando json_schema → json_object
+        → texto libre. Recuerda el primer modo que el servidor acepte para no
+        repetir la negociación en cada llamada de la sesión."""
+        ladder = (self._struct_mode,) if self._struct_mode else self._STRUCT_LADDER
+        last_exc = None
+        for mode in ladder:
+            kwargs = dict(base_kwargs)
+            fmt = self._structured_format(mode)
+            if fmt is not None:
+                kwargs["response_format"] = fmt
+            try:
+                response = self.client.chat.completions.create(**kwargs)
+                if self._struct_mode != mode:
+                    self._struct_mode = mode
+                    self.logger.info(
+                        "Salida estructurada negociada: %s",
+                        mode if mode != "free" else "texto libre (servidor sin JSON mode)",
+                    )
+                return response
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc).lower()
+                # Solo descendemos de escalón si el rechazo es por response_format.
+                if "response_format" in msg or "json_schema" in msg or "json_object" in msg:
+                    self.logger.warning(
+                        "response_format=%s rechazado por el servidor; probando siguiente modo.",
+                        mode,
+                    )
+                    last_exc = exc
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+
+    def chat_completion(
+        self,
+        prompt: str,
+        system_message: str = None,
+        temperature: float = 0.1,
+        max_tokens: int = 2000,
+        json_mode: bool = False,
+    ) -> Optional[str]:
+        """Realiza una consulta a LM Studio.
+
+        Si json_mode=True, fuerza response_format={"type":"json_object"} para
+        que el servidor garantice JSON sintácticamente válido (evita los
+        fallbacks de _safe_json cuando el modelo se va por la borda).
+        """
         if not self.available or not self.client:
             self.logger.warning("🚫 LM Studio no disponible, no se puede hacer la consulta")
             return None
-        
+
         try:
             messages = []
-            
+
             if system_message:
                 messages.append({
                     'role': 'system',
                     'content': system_message
                 })
-            
+
             messages.append({
                 'role': 'user',
                 'content': prompt
             })
-            
+
             self.logger.info("🤖 Enviando petición a LM Studio...")
             self.logger.debug(f"   Modelo: {self.model}")
             self.logger.debug(f"   Temperature: {temperature}")
+            self.logger.debug(f"   JSON mode: {json_mode}")
             self.logger.debug(f"   Prompt length: {len(prompt)} caracteres")
-            
+
             import time
             start_time = time.time()
-            
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                top_p=0.9,
-                timeout=120.0  # Timeout específico de 2 minutos para completions
-            )
-            
+
+            create_kwargs = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "top_p": 0.9,
+                "timeout": 120.0,
+            }
+
+            if json_mode:
+                # Fuerza JSON válido negociando el modo de salida estructurada
+                # que acepte el servidor (json_schema → json_object → texto libre).
+                response = self._create_structured(create_kwargs)
+            else:
+                response = self.client.chat.completions.create(**create_kwargs)
+
             elapsed_time = time.time() - start_time
             response_content = response.choices[0].message.content
             
@@ -164,8 +247,8 @@ Instrucciones:
 
 Responde SOLO con el JSON estructurado:"""
 
-        response = self.chat_completion(prompt, system_message, temperature=0.1)
-        
+        response = self.chat_completion(prompt, system_message, temperature=0.1, json_mode=True)
+
         if response:
             try:
                 # Limpiar la respuesta para extraer solo el JSON

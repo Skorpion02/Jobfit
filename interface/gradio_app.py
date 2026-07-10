@@ -1,6 +1,9 @@
 import gradio as gr
+import hashlib
+import logging
 import os
 import json
+import time
 from typing import Dict, Optional, Tuple, List
 import tempfile
 from pathlib import Path
@@ -14,7 +17,11 @@ from src.matcher.semantic_matcher import SemanticMatcher
 from src.generator.cv_adapter import CVAdapter
 from src.generator.ats_optimizer import ATS_Optimizer # <- Importar el nuevo optimizador
 from src.generator.cv_full_analyzer import CVFullAnalyzer  # <- Análisis Pro ATS
+from src.utils.cv_utils import normalize_cv_data
+from interface import aurora  # tema visual + helpers HTML del rediseño Aurora
 import uuid # <- Importar para nombres de archivo únicos
+
+logger = logging.getLogger(__name__)
 
 class JobFitApp:
     def __init__(self):
@@ -31,12 +38,48 @@ class JobFitApp:
         self.current_job_data = None
         self.current_cv_data = None
         self.current_matching = None
+        # Hashes para detectar cambios y evitar re-parseo innecesario
+        self._last_job_hash: Optional[str] = None
+        self._last_cv_hash: Optional[str] = None
     
     def _clear_cache(self):
-        """Limpia el caché de datos previos"""
+        """Limpia solo el matching (depende del par CV+job concreto).
+        Los datos parseados de job y CV se reutilizan si el contenido no cambió."""
+        self.current_matching = None
+
+    def _clear_all(self):
+        """Limpieza completa incluyendo job y CV cacheados."""
         self.current_job_data = None
         self.current_cv_data = None
         self.current_matching = None
+        self._last_job_hash = None
+        self._last_cv_hash = None
+
+    def _get_job_data(self, job_text: str) -> dict:
+        """Parsea la oferta solo si el texto cambió desde la última vez."""
+        job_hash = hashlib.md5(job_text.encode()).hexdigest()
+        if self._last_job_hash == job_hash and self.current_job_data is not None:
+            logger.info("Reutilizando job_data cacheado (hash=%s)", job_hash[:8])
+            return self.current_job_data
+        self.current_job_data = self.job_parser.extract_job_data(job_text)
+        self._last_job_hash = job_hash
+        return self.current_job_data
+
+    def _get_cv_data(self, cv_file_path: str) -> dict:
+        """Parsea el CV solo si el archivo cambió desde la última vez."""
+        try:
+            stat = os.stat(cv_file_path)
+            cv_hash = hashlib.md5(f"{cv_file_path}:{stat.st_size}:{stat.st_mtime}".encode()).hexdigest()
+        except OSError:
+            cv_hash = hashlib.md5(cv_file_path.encode()).hexdigest()
+        if self._last_cv_hash == cv_hash and self.current_cv_data is not None:
+            logger.info("Reutilizando cv_data cacheado (hash=%s)", cv_hash[:8])
+            return self.current_cv_data
+        file_ext = os.path.splitext(cv_file_path)[1][1:].lower()
+        cv_data = self.cv_parser.parse_cv(cv_file_path, file_ext)
+        self.current_cv_data = normalize_cv_data(cv_data)
+        self._last_cv_hash = cv_hash
+        return self.current_cv_data
 
     # ─────────────────────────────────────────────
     #  ANÁLISIS COMPLETO ATS (Propuesta A → F)
@@ -52,6 +95,7 @@ class JobFitApp:
         pais: str,
         rol_objetivo: str,
         nivel: str,
+        progress: gr.Progress = gr.Progress(),
     ):
         """
         Ejecuta el análisis completo ATS y devuelve los 6 entregables
@@ -62,6 +106,11 @@ class JobFitApp:
             download_cv_txt, status_md
         """
         try:
+            _t_start = time.perf_counter()
+            logger.info("[ATS] Análisis completo iniciado.")
+
+            progress(0.02, desc="Procesando oferta…")
+
             # 1. Obtener texto de la oferta
             if job_url.strip():
                 job_text = self.scraper.scrape_job_offer(job_url.strip())
@@ -74,22 +123,23 @@ class JobFitApp:
                 err = "❌ Proporciona una URL o pega el texto de la oferta."
                 return err, "", "", "", "", "", None, None, err
 
-            # 2. Parsear oferta
-            job_data = self.job_parser.extract_job_data(job_text)
+            # 2. Parsear oferta (reutiliza caché si el texto no cambió)
+            progress(0.06, desc="Extrayendo info estructurada de la oferta con IA…")
+            job_data = self._get_job_data(job_text)
 
-            # 3. Parsear CV
+            # 3. Parsear CV (reutiliza caché si es el mismo archivo)
             if not cv_file:
                 err = "❌ Sube un archivo de CV (PDF, DOCX o TXT)."
                 return err, "", "", "", "", "", None, None, err
 
+            progress(0.10, desc="Parseando CV…")
             cv_file_path = cv_file if isinstance(cv_file, str) else cv_file.name
-            file_ext = os.path.splitext(cv_file_path)[1][1:].lower()
-            cv_data = self.cv_parser.parse_cv(cv_file_path, file_ext)
+            cv_data = self._get_cv_data(cv_file_path)
             if cv_data is None:
                 cv_data = {}
 
             # 4. Ejecutar análisis completo
-            # logros y stack se auto-extraen del CV por el LLM en CVFullAnalyzer
+            _t_llm_start = time.perf_counter()
             results = self.full_analyzer.analyze(
                 cv_data=cv_data,
                 job_data=job_data,
@@ -100,6 +150,13 @@ class JobFitApp:
                 nivel=nivel or "",
                 logros="",
                 stack="",
+                progress_cb=lambda frac, desc: progress(frac, desc=desc),
+            )
+            _t_llm_end = time.perf_counter()
+            logger.info(
+                "[ATS] LLM calls completadas en %.1fs (cache=%s).",
+                _t_llm_end - _t_llm_start,
+                results.get("_from_cache", False),
             )
 
             llm_note = (
@@ -240,11 +297,29 @@ class JobFitApp:
 """
 
             status = f"✅ Análisis completo generado {'con LM Studio' if results.get('llm_used') else '(modo básico — activa LM Studio para mejor calidad)'}"
+            _t_total = time.perf_counter() - _t_start
+            logger.info(
+                "[ATS] ✅ Análisis finalizado en %.1fs (LLM=%.1fs, formato+export=%.1fs).",
+                _t_total,
+                _t_llm_end - _t_llm_start,
+                _t_total - (_t_llm_end - _t_llm_start),
+            )
+            progress(1.0, desc=f"✅ Completado en {_t_total:.0f}s")
             return tab_a, tab_b, tab_c, tab_d, tab_e, tab_f, str(txt_path), str(docx_path), status
 
+        except ValueError as exc:
+            # Errores de validación (CV demasiado grande, formato no soportado, etc.)
+            _t_total = time.perf_counter() - _t_start
+            logger.warning("[ATS] ⚠️ Validación tras %.1fs: %s", _t_total, exc)
+            err = f"❌ {exc}"
+            return err, "", "", "", "", "", None, None, err
         except Exception as exc:
-            import traceback
-            err = f"❌ Error en el análisis: {exc}\n\n```\n{traceback.format_exc()}\n```"
+            _t_total = time.perf_counter() - _t_start
+            logger.exception("[ATS] ❌ Error tras %.1fs: %s", _t_total, exc)
+            err = (
+                "❌ Error procesando el análisis. "
+                "Revisa `logs/jobfit.log` para el detalle técnico."
+            )
             return err, "", "", "", "", "", None, None, err
 
     def _plain_text_to_docx(self, text: str, filename: str) -> str:
@@ -464,9 +539,6 @@ class JobFitApp:
     def audit_job_offer(self, url: str, manual_text: str) -> Tuple[str, str, str]:
         """Audita una oferta de trabajo"""
         try:
-            # Limpiar caché previo
-            self._clear_cache()
-            
             # Obtener texto de la oferta
             if url.strip():
                 job_text = self.scraper.scrape_job_offer(url)
@@ -476,9 +548,9 @@ class JobFitApp:
                 job_text = manual_text
             else:
                 return "❌ Error: Proporciona una URL o pega el texto de la oferta", "", ""
-            
-            # Extraer datos estructurados
-            self.current_job_data = self.job_parser.extract_job_data(job_text)
+
+            # Extraer datos estructurados (reutiliza caché si el texto no cambió)
+            self.current_job_data = self._get_job_data(job_text)
             
             # Calcular score de realismo
             audit_result = self.scorer.calculate_realism_score(self.current_job_data)
@@ -524,10 +596,8 @@ class JobFitApp:
     def process_cv_and_match(self, cv_file, job_url: str, manual_job_text: str) -> Tuple[str, str, Optional[str], Optional[str]]:
         """Procesa CV, hace matching y genera AMBOS archivos"""
         try:
-            # Limpiar caché previo para evitar datos de consultas anteriores
             self._clear_cache()
-            
-            # Siempre procesar datos de la oferta actual (evitar caché)
+
             if job_url.strip():
                 job_text = self.scraper.scrape_job_offer(job_url)
                 if not job_text:
@@ -536,54 +606,21 @@ class JobFitApp:
                 job_text = manual_job_text
             else:
                 return "❌ Error: Proporciona una URL o pega el texto de la oferta", "", None, None
-            
-            # Extraer datos de la oferta (sin usar caché)
-            job_data = self.job_parser.extract_job_data(job_text)
-            
+
+            # Reutiliza job_data si el texto no cambió
+            job_data = self._get_job_data(job_text)
+
             # Procesar CV
             if not cv_file:
                 return "❌ Error: Sube un archivo de CV", "", None, None
-            
+
             # En Gradio 4.4.0, cv_file es directamente la ruta del archivo temporal
             cv_file_path = cv_file if isinstance(cv_file, str) else cv_file.name
-            
-            # Determinar tipo de archivo
-            file_extension = os.path.splitext(cv_file_path)[1][1:].lower()
-            
-            # Parsear CV
-            self.current_cv_data = self.cv_parser.parse_cv(cv_file_path, file_extension)
 
-            # Defensive normalization: asegurar tipos esperados para evitar
-            # errores 'NoneType' object is not iterable en la UI
-            if self.current_cv_data is None:
-                self.current_cv_data = {}
+            # Parsear CV (reutiliza si es el mismo archivo)
+            self.current_cv_data = self._get_cv_data(cv_file_path)
+            # normalize_cv_data ya se aplica dentro de _get_cv_data
 
-            if not isinstance(self.current_cv_data.get('experience'), list):
-                self.current_cv_data['experience'] = self.current_cv_data.get('experience') or []
-            if not isinstance(self.current_cv_data.get('education'), list):
-                self.current_cv_data['education'] = self.current_cv_data.get('education') or []
-            if not isinstance(self.current_cv_data.get('projects'), list):
-                self.current_cv_data['projects'] = self.current_cv_data.get('projects') or []
-
-            # Normalizar skills a dict con 'technical' y 'other'
-            skills_field = self.current_cv_data.get('skills')
-            if isinstance(skills_field, list):
-                self.current_cv_data['skills'] = {'technical': skills_field, 'other': []}
-            elif isinstance(skills_field, dict):
-                tech = skills_field.get('technical') or []
-                other = skills_field.get('other') or []
-                if isinstance(tech, str):
-                    tech = [tech]
-                if isinstance(other, str):
-                    other = [other]
-                self.current_cv_data['skills'] = {'technical': tech, 'other': other}
-            else:
-                self.current_cv_data['skills'] = {'technical': [], 'other': []}
-
-            # Asegurar raw_text
-            if not isinstance(self.current_cv_data.get('raw_text'), str):
-                self.current_cv_data['raw_text'] = ''
-            
             # Realizar matching con información de tipos de requisitos
             # Normalización defensiva para evitar iteración sobre None
             must_have_reqs = job_data.get('must_have') or []
@@ -920,261 +957,464 @@ No se pudieron procesar los requisitos o el CV. Verifica que:
             })
         matching_results['missing_requirements'] = enriched_missing
     
+    # ─────────────────────────────────────────────────────────────────
+    #  Helpers para el rediseño Aurora
+    # ─────────────────────────────────────────────────────────────────
+
+    def _lmstudio_state(self) -> Tuple[bool, Optional[str]]:
+        """Devuelve (disponible, modelo_activo) consultando el cliente global."""
+        try:
+            from src.llm.lmstudio_client import lmstudio_client
+            return bool(lmstudio_client.available), lmstudio_client.model
+        except Exception:  # noqa: BLE001
+            return False, None
+
+    def _build_results_html(
+        self,
+        results: Dict,
+        rol_objetivo: str,
+        idioma: str,
+        longitud: str,
+        pais: str,
+        cv_text: str,
+        has_files: bool,
+    ) -> str:
+        """Compone el bloque HTML completo del Paso 4 a partir del payload
+        devuelto por CVFullAnalyzer.analyze. Tolerante a campos faltantes."""
+        header = aurora.render_results_header(rol_objetivo, idioma, longitud, pais)
+        row1 = (
+            '<div class="aurora-grid-2">'
+            + aurora.render_score_card(results.get("A_diagnosis", {}))
+            + aurora.render_keywords_card(results.get("B_keywords", {}))
+            + '</div>'
+        )
+        row2 = (
+            '<div class="aurora-grid-3">'
+            + aurora.render_plan_card(results.get("C_changes", {}))
+            + aurora.render_cv_preview_card(cv_text, has_files)
+            + aurora.render_checklist_card(results.get("F_checklist", {}))
+            + '</div>'
+        )
+        variants = aurora.render_variants_card(results.get("E_variants", {}))
+        return header + row1 + row2 + variants
+
+    # ─────────────────────────────────────────────────────────────────
+    #  UI principal (wizard Aurora)
+    # ─────────────────────────────────────────────────────────────────
+
     def create_interface(self):
-        """Crea la interfaz Gradio"""
-        
-        # Verificar estado de LM Studio
-        lmstudio_status = self._get_lmstudio_status()
-        
-        with gr.Blocks(title="JobFit Agent") as app:
-            gr.Markdown(f"""
-# 🎯 JobFit Agent
-## Auditoría Inteligente de Ofertas y Adaptación de CV
+        """Crea la interfaz Gradio con el rediseño Aurora (wizard 4 pasos)."""
 
-Analiza ofertas de trabajo y adapta tu CV de forma inteligente sin añadir información falsa.
+        lm_available, lm_model = self._lmstudio_state()
 
-{lmstudio_status}
-""")
-            
-            with gr.Tabs():
-                # Pestaña 1: Auditoría de Oferta
-                with gr.TabItem("🔍 Auditar Oferta"):
-                    gr.Markdown("### Analiza el realismo y extrae información estructurada de una oferta")
-                    
+        # Tema base Gradio mínimo (el grueso del estilo vive en aurora.AURORA_CSS).
+        # Solo neutralizamos colores y radios para que Gradio no choque con Aurora.
+        theme = gr.themes.Base(
+            primary_hue=gr.themes.colors.indigo,
+            neutral_hue=gr.themes.colors.slate,
+            font=[gr.themes.GoogleFont("Plus Jakarta Sans"), "system-ui", "sans-serif"],
+        ).set(
+            body_background_fill="transparent",
+            body_background_fill_dark="transparent",
+            block_background_fill="transparent",
+            block_background_fill_dark="transparent",
+            block_border_width="0px",
+            block_radius="12px",
+        )
+
+        with gr.Blocks(
+            title="JobFit Agent",
+            theme=theme,
+            css=aurora.AURORA_CSS,
+            # El toggle de tema vive ahora en AURORA_HEAD (script en <head> con
+            # event delegation). No usamos js= para no duplicar el listener.
+            head=aurora.AURORA_HEAD,
+            analytics_enabled=False,
+        ) as app:
+
+            # ── Barra global sticky con toggle de tema ────────────────
+            gr.HTML(aurora.render_tbar("Análisis Pro ATS · IA local"))
+
+            # ── Shell del wizard ──────────────────────────────────────
+            with gr.Column(elem_classes=["aurora", "aurora-shell"]):
+
+                # App top bar (marca + pill de estado LM Studio)
+                topbar_html = gr.HTML(aurora.render_app_topbar(lm_available, lm_model))
+
+                # Stepper (4 nodos, se actualiza con cada navegación)
+                stepper_html = gr.HTML(aurora.render_stepper(1))
+
+                # Estado del paso actual (1..4)
+                state_step = gr.State(1)
+                # Estado del último análisis para regenerar HTML en cambios de variante
+                state_results = gr.State(None)
+
+                # ── PASO 1: Subir CV ──────────────────────────────────
+                with gr.Column(visible=True, elem_classes=["aurora-body"]) as g_step1:
+                    gr.HTML(
+                        '<div class="aurora-eyebrow">Paso 1 de 4</div>'
+                        '<h2>Sube tu CV</h2>'
+                        '<p>PDF, DOCX o TXT (máx. 10 MB). Tus datos no salen de tu máquina.</p>'
+                    )
+                    s1_cv_file = gr.File(
+                        label="Arrastra tu CV o haz clic para seleccionar",
+                        file_types=[".pdf", ".docx", ".txt"],
+                    )
+                    s1_alert = gr.HTML(visible=False)
                     with gr.Row():
-                        with gr.Column():
-                            job_url = gr.Textbox(
-                                label="🔗 URL de la oferta", 
-                                placeholder="https://...",
-                                lines=1
-                            )
-                            job_text_manual = gr.Textbox(
-                                label="📝 O pega aquí el texto de la oferta", 
-                                placeholder="Descripción completa de la oferta...",
-                                lines=8
-                            )
-                            audit_btn = gr.Button("🚀 Auditar Oferta", variant="primary")
-                        
-                        with gr.Column():
-                            audit_results = gr.Markdown(label="📊 Resultados del Audit")
-                            category_breakdown = gr.Markdown(label="📈 Desglose por Categorías")
-                    
-                    with gr.Row():
-                        job_json_output = gr.Code(
-                            label="📋 Datos Estructurados (JSON)", 
-                            language="json"
+                        s1_next = gr.Button("Siguiente →", variant="primary", size="lg")
+
+                # ── PASO 2: Oferta ────────────────────────────────────
+                # visible=True: render anticipado (igual que el Paso 3). El Paso 2
+                # contiene el acordeón de auditoría; con render perezoso quedaba en
+                # display:none al mostrarlo. El app.load lo colapsa al cargar.
+                with gr.Column(visible=True, elem_classes=["aurora-body"]) as g_step2:
+                    gr.HTML(
+                        '<div class="aurora-eyebrow">Paso 2 de 4</div>'
+                        '<h2>Pega la oferta</h2>'
+                        '<p>Usa la URL del portal (LinkedIn, Indeed, InfoJobs, Tecnoempleo…) '
+                        'o pega el texto completo de la descripción.</p>'
+                    )
+                    s2_job_url = gr.Textbox(
+                        label="URL de la oferta",
+                        placeholder="https://www.linkedin.com/jobs/view/...",
+                        lines=1,
+                    )
+                    s2_job_text = gr.Textbox(
+                        label="O pega aquí el texto de la oferta",
+                        placeholder="Descripción completa de la oferta…",
+                        lines=10,
+                    )
+                    # Auditoría de realismo opcional: reutiliza la MISMA oferta de
+                    # arriba (no se vuelve a pedir la URL/texto en otro sitio).
+                    with gr.Accordion("🔍 Auditar realismo de la oferta (opcional)", open=False):
+                        gr.Markdown(
+                            "Comprueba si la oferta es realista antes de adaptar tu CV. "
+                            "Usa la URL o el texto introducidos arriba."
                         )
-                    
-                    audit_btn.click(
+                        s2_audit_btn = gr.Button("Auditar realismo", variant="secondary")
+                        s2_audit_summary = gr.Markdown()
+                        s2_audit_cats = gr.Markdown()
+                        s2_audit_json = gr.Code(label="Datos estructurados (JSON)", language="json")
+                    s2_audit_btn.click(
                         fn=self.audit_job_offer,
-                        inputs=[job_url, job_text_manual],
-                        outputs=[audit_results, category_breakdown, job_json_output]
+                        inputs=[s2_job_url, s2_job_text],
+                        outputs=[s2_audit_summary, s2_audit_cats, s2_audit_json],
                     )
-                    
-                # Pestaña 3: Análisis Pro ATS (A → F)
-                with gr.TabItem("🎯 Análisis Pro ATS"):
-                    gr.Markdown("""
-### Análisis Completo ATS
-Genera los **6 entregables** del proceso de adaptación profesional:
-A) Diagnóstico · B) Keywords · C) Plan de cambios · D) CV reescrito · E) Variantes · F) Checklist
-""")
+                    s2_alert = gr.HTML(visible=False)
                     with gr.Row():
-                        with gr.Column(scale=1):
-                            gr.Markdown("#### 📁 Datos de entrada")
-                            pro_cv_file = gr.File(
-                                label="CV (PDF, DOCX o TXT)",
-                                file_types=[".pdf", ".docx", ".txt"],
-                            )
-                            pro_job_url = gr.Textbox(
-                                label="🔗 URL de la oferta (opcional)",
-                                placeholder="https://...",
-                                lines=1,
-                            )
-                            pro_job_text = gr.Textbox(
-                                label="📝 Texto de la oferta",
-                                placeholder="Pega aquí la descripción completa de la oferta...",
-                                lines=7,
-                            )
-                            gr.Markdown("#### ⚙️ Preferencias del candidato")
-                            pro_idioma = gr.Dropdown(
-                                choices=["ES", "EN", "FR", "DE", "PT"],
-                                value="ES",
-                                label="Idioma del CV final",
-                            )
-                            pro_longitud = gr.Dropdown(
-                                choices=["1 página", "2 páginas"],
-                                value="2 páginas",
-                                label="Longitud deseada",
-                            )
-                            pro_pais = gr.Textbox(
-                                label="País / mercado (opcional)",
-                                placeholder="Ej: España, Latinoamérica…",
-                                lines=1,
-                            )
-                            pro_rol = gr.Textbox(
-                                label="Rol objetivo exacto (si difiere de la oferta)",
-                                placeholder="Ej: Data Analyst Senior",
-                                lines=1,
-                            )
-                            pro_nivel = gr.Dropdown(
-                                choices=["", "Junior", "Mid", "Senior", "Lead / Principal"],
-                                value="",
-                                label="Nivel deseado",
-                            )
-                            gr.Markdown(
-                                "> 🤖 Los **logros medibles** y el **stack tecnológico** "
-                                "se extraen automáticamente de tu CV con LM Studio."
-                            )
-                            pro_btn = gr.Button("🚀 Generar Análisis Completo", variant="primary", size="lg")
+                        s2_prev = gr.Button("← Atrás", variant="secondary")
+                        s2_next = gr.Button("Siguiente →", variant="primary", size="lg")
 
-                        with gr.Column(scale=2):
-                            pro_status = gr.Markdown(label="Estado")
-                            with gr.Tabs():
-                                with gr.TabItem("A) Diagnóstico"):
-                                    pro_tab_a = gr.Markdown()
-                                with gr.TabItem("B) Keywords ATS"):
-                                    pro_tab_b = gr.Markdown()
-                                with gr.TabItem("C) Plan de cambios"):
-                                    pro_tab_c = gr.Markdown()
-                                with gr.TabItem("D) CV reescrito"):
-                                    pro_tab_d = gr.Textbox(
-                                        label="CV en texto plano (listo para pegar)",
-                                        lines=35,
-                                    )
-                                    with gr.Row():
-                                        pro_download = gr.File(
-                                            label="⬇️ Descargar TXT",
-                                            interactive=False,
-                                        )
-                                        pro_download_docx = gr.File(
-                                            label="⬇️ Descargar DOCX",
-                                            interactive=False,
-                                        )
-                                with gr.TabItem("E) Variantes"):
-                                    pro_tab_e = gr.Markdown()
-                                with gr.TabItem("F) Checklist"):
-                                    pro_tab_f = gr.Markdown()
-
-                    pro_btn.click(
-                        fn=self.analyze_full_cv,
-                        inputs=[
-                            pro_cv_file,
-                            pro_job_url,
-                            pro_job_text,
-                            pro_idioma,
-                            pro_longitud,
-                            pro_pais,
-                            pro_rol,
-                            pro_nivel,
-                        ],
-                        outputs=[
-                            pro_tab_a,
-                            pro_tab_b,
-                            pro_tab_c,
-                            pro_tab_d,
-                            pro_tab_e,
-                            pro_tab_f,
-                            pro_download,
-                            pro_download_docx,
-                            pro_status,
-                        ],
+                # ── PASO 3: Preferencias ──────────────────────────────
+                # visible=True a propósito: Gradio 6 renderiza las columnas ocultas
+                # de forma perezosa, y al mostrar por primera vez una columna con
+                # gr.Dropdown queda en display:none (bug). Forzando el render inicial,
+                # el app.load de abajo la colapsa y luego navegar es solo un flip de
+                # display sobre una columna ya renderizada (sí funciona).
+                with gr.Column(visible=True, elem_classes=["aurora-body"]) as g_step3:
+                    gr.HTML(
+                        '<div class="aurora-eyebrow">Paso 3 de 4</div>'
+                        '<h2>Ajusta tus preferencias</h2>'
+                        '<p>Estos parámetros guían cómo el LLM reescribe tu CV.</p>'
                     )
-
-                # Pestaña 4: Diagnóstico
-                with gr.TabItem("🔧 Diagnóstico"):
-                    gr.Markdown("### Diagnóstico del Sistema y LM Studio")
-                    
                     with gr.Row():
-                        refresh_diagnostics_btn = gr.Button("🔄 Actualizar Diagnóstico", variant="secondary")
-                    
-                    diagnostics_output = gr.Markdown(value=self.get_diagnostics())
-                    
-                    gr.Markdown("### 📋 Logs Recientes")
-                    
+                        s3_idioma = gr.Dropdown(
+                            choices=["ES", "EN", "FR", "DE", "PT"],
+                            value="ES",
+                            label="Idioma del CV final",
+                        )
+                        s3_longitud = gr.Dropdown(
+                            choices=["1 página", "2 páginas"],
+                            value="2 páginas",
+                            label="Longitud deseada",
+                        )
                     with gr.Row():
-                        with gr.Column(scale=4):
-                            log_lines_slider = gr.Slider(
-                                minimum=50, maximum=500, value=100, step=50,
-                                label="Número de líneas a mostrar"
-                            )
-                        with gr.Column(scale=1):
-                            refresh_logs_btn = gr.Button("🔄 Actualizar Logs", variant="secondary")
-                    
-                    logs_output = gr.Textbox(
-                        value=self.get_recent_logs(100),
-                        label="Últimas líneas del log",
-                        lines=20,
-                        max_lines=30
+                        s3_pais = gr.Textbox(
+                            label="País / mercado (opcional)",
+                            placeholder="Ej: España, Latinoamérica…",
+                            lines=1,
+                        )
+                        s3_rol = gr.Textbox(
+                            label="Rol objetivo (si difiere de la oferta)",
+                            placeholder="Ej: Data Analyst Senior",
+                            lines=1,
+                        )
+                    s3_nivel = gr.Dropdown(
+                        choices=["", "Junior", "Mid", "Senior", "Lead / Principal"],
+                        value="",
+                        label="Nivel deseado",
                     )
-                    
-                    gr.Markdown("""
-### 💡 Consejos de Diagnóstico
+                    s3_status = gr.HTML(visible=False)
+                    with gr.Row():
+                        s3_prev = gr.Button("← Atrás", variant="secondary")
+                        s3_analyze = gr.Button("🚀 Analizar y generar informe", variant="primary", size="lg")
 
-**Si LM Studio no se conecta:**
-1. Verifica que LM Studio esté abierto
-2. Ve a la pestaña "Local Server" en LM Studio
-3. Asegúrate de que un modelo esté cargado
-4. Haz click en "Start Server"
-5. Verifica que el puerto sea 1234 (o actualiza `config/settings.py`)
+                # ── PASO 4: Resultados ────────────────────────────────
+                # visible=True: render anticipado por consistencia (evita el bug de
+                # render perezoso si más adelante se enriquece este paso). El
+                # app.load lo colapsa al cargar.
+                with gr.Column(visible=True, elem_classes=["aurora-body"]) as g_step4:
+                    results_html = gr.HTML(
+                        '<div class="aurora-eyebrow">Paso 4 de 4</div>'
+                        '<h2>Resultados</h2>'
+                        '<p>El análisis aparecerá aquí cuando pulses «Analizar».</p>'
+                    )
+                    with gr.Row():
+                        s4_cv_textbox = gr.Textbox(
+                            label="CV reescrito (texto plano)",
+                            lines=12,
+                            interactive=True,
+                        )
+                    with gr.Row():
+                        s4_download_txt = gr.File(label="⬇ TXT", interactive=False)
+                        s4_download_docx = gr.File(label="⬇ DOCX", interactive=False)
+                    with gr.Row():
+                        s4_prev = gr.Button("← Atrás", variant="secondary")
+                        s4_new = gr.Button("✨ Nuevo análisis", variant="primary")
 
-**Para ver logs en tiempo real:**
-- Ejecuta `view_logs.bat` en una ventana separada
-- Los logs se actualizarán automáticamente
+            # ── Sección secundaria: herramientas + diagnóstico ────────
+            with gr.Accordion("🔧 Herramientas avanzadas y diagnóstico", open=False):
+                with gr.Tabs():
+                    # (La auditoría de oferta se integró en el Paso 2 del wizard,
+                    #  reutilizando el mismo input de oferta — sin duplicarlo aquí.)
 
-**Niveles de log:**
-- 🟢 INFO: Operaciones normales
-- 🟡 WARNING: Advertencias no críticas
-- 🔴 ERROR: Errores que requieren atención
+                    # Diagnóstico del sistema
+                    with gr.TabItem("Diagnóstico"):
+                        diag_md = gr.Markdown(value=self.get_diagnostics())
+                        diag_refresh = gr.Button("Actualizar diagnóstico", variant="secondary")
+                        diag_refresh.click(fn=self.get_diagnostics, inputs=[], outputs=[diag_md])
+
+                        gr.Markdown("### Logs recientes")
+                        log_lines = gr.Slider(50, 500, value=100, step=50, label="Líneas a mostrar")
+                        log_box = gr.Textbox(
+                            value=self.get_recent_logs(100),
+                            label="Últimas líneas",
+                            lines=18,
+                        )
+                        log_refresh = gr.Button("Actualizar logs", variant="secondary")
+                        log_refresh.click(fn=self.get_recent_logs, inputs=[log_lines], outputs=[log_box])
+                        clear_cache_btn = gr.Button("🗑 Limpiar caché de análisis", variant="secondary")
+                        clear_cache_msg = gr.Markdown()
+                        clear_cache_btn.click(
+                            fn=lambda: (self.full_analyzer.clear_cache(), "✅ Caché limpiada.")[1],
+                            inputs=[],
+                            outputs=[clear_cache_msg],
+                        )
+
+                    # Sobre JobFit
+                    with gr.TabItem("Información"):
+                        gr.Markdown("""
+### Sobre JobFit Agent
+
+JobFit analiza una oferta y adapta tu CV **sin inventar nada**, con IA local (LM Studio).
+Privacidad por defecto: nada de lo que subes sale de tu máquina.
+
+**Principios de veracidad:**
+- ✅ Reorganiza información real del CV.
+- ✅ Destaca experiencias y skills existentes.
+- ❌ Nunca inventa ni infiere datos.
+
+**Algoritmos:**
+- Embeddings semánticos (`all-MiniLM-L6-v2`) para matching CV ↔ requisitos.
+- LM Studio (recomendado: Qwen2.5-14B-Instruct) para los 6 entregables ATS.
+
+Más detalle en [`docs/STRUCTURE.md`](docs/STRUCTURE.md) y [`docs/SETUP.md`](docs/SETUP.md).
 """)
-                    
-                    # Eventos de actualización
-                    refresh_diagnostics_btn.click(
-                        fn=self.get_diagnostics,
-                        inputs=[],
-                        outputs=[diagnostics_output]
+
+            # ── Lógica de navegación del wizard ───────────────────────
+
+            def _goto(step: int):
+                """Devuelve los updates para mostrar el paso `step` y actualizar stepper/estado."""
+                return (
+                    gr.update(visible=step == 1),
+                    gr.update(visible=step == 2),
+                    gr.update(visible=step == 3),
+                    gr.update(visible=step == 4),
+                    aurora.render_stepper(step),
+                    step,
+                )
+
+            def go_step1_next(cv_file):
+                if not cv_file:
+                    return (
+                        gr.update(),  # step1 visible (no cambia)
+                        gr.update(visible=False),
+                        gr.update(visible=False),
+                        gr.update(visible=False),
+                        aurora.render_stepper(1),
+                        1,
+                        gr.update(value=aurora.render_alert("Sube un CV (PDF, DOCX o TXT) para continuar."), visible=True),
                     )
-                    
-                    refresh_logs_btn.click(
-                        fn=self.get_recent_logs,
-                        inputs=[log_lines_slider],
-                        outputs=[logs_output]
+                return (*_goto(2), gr.update(visible=False))
+
+            def go_step2_next(url, text):
+                if not (url or "").strip() and not (text or "").strip():
+                    return (
+                        gr.update(visible=False),
+                        gr.update(),
+                        gr.update(visible=False),
+                        gr.update(visible=False),
+                        aurora.render_stepper(2),
+                        2,
+                        gr.update(value=aurora.render_alert("Pega la URL o el texto de la oferta."), visible=True),
                     )
-                
-                # Pestaña 4: Información
-                with gr.TabItem("ℹ️ Información"):
-                    gr.Markdown("""
-### 🤖 Sobre JobFit Agent
+                return (*_goto(3), gr.update(visible=False))
 
-Este agente inteligente te ayuda a:
+            def go_back(target: int):
+                return _goto(target)
 
-1. **🔍 Auditar ofertas de trabajo**: 
-   - Calcula un score de realismo (0-100)
-   - Detecta requisitos excesivos o contradictorios
-   - Extrae información estructurada
+            def go_new_analysis():
+                # Volver al paso 1 limpiando alertas
+                return (*_goto(1), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False))
 
-2. **🎯 Adaptar tu CV**: 
-   - Reordena experiencias por relevancia
-   - Genera resumen dirigido a la oferta
-   - **NUNCA inventa información falsa**
+            # ── Análisis: paso 3 → paso 4 ─────────────────────────────
 
-3. **📊 Análisis de encaje**:
-   - Matching semántico entre requisitos y evidencias
-   - Identifica gaps de competencias
-   - Proporciona recomendaciones de mejora
+            def run_analysis(
+                cv_file,
+                job_url,
+                job_text,
+                idioma,
+                longitud,
+                pais,
+                rol_objetivo,
+                nivel,
+                progress=gr.Progress(),
+            ):
+                # Delega en analyze_full_cv y mapea su salida tupla a HTML Aurora
+                try:
+                    result = self.analyze_full_cv(
+                        cv_file, job_url, job_text,
+                        idioma, longitud, pais, rol_objetivo, nivel,
+                        progress=progress,
+                    )
+                except TypeError:
+                    # Compat con versiones de analyze_full_cv sin el kwarg progress
+                    result = self.analyze_full_cv(
+                        cv_file, job_url, job_text,
+                        idioma, longitud, pais, rol_objetivo, nivel,
+                    )
 
-### 🛡️ Principios de Veracidad
-- ✅ Solo reorganiza información real del CV
-- ✅ Destaca experiencias relevantes existentes
-- ❌ NO inventa skills ni experiencias
-- ❌ NO añade información no verificable
+                # Estructura de result: (tab_a, tab_b, tab_c, tab_d, tab_e, tab_f, txt_path, docx_path, status)
+                if isinstance(result, tuple) and len(result) >= 9:
+                    tab_a, tab_b, tab_c, tab_d, tab_e, tab_f, txt_path, docx_path, status = result
+                else:
+                    err_html = aurora.render_alert(
+                        "Error procesando el análisis. Revisa logs/jobfit.log.", "bad"
+                    )
+                    return (
+                        # no avanzamos de paso
+                        gr.update(visible=False),
+                        gr.update(visible=False),
+                        gr.update(),
+                        gr.update(visible=False),
+                        aurora.render_stepper(3),
+                        3,
+                        err_html,
+                        gr.update(),
+                        None,
+                        None,
+                        None,
+                    )
 
-### 🔒 Privacidad
-- Los datos se procesan localmente
-- No se almacenan CVs ni información personal
-- Archivos temporales se eliminan automáticamente
-""")
-        
+                # Si tab_a empieza con ❌ es un error de validación (CV faltante, URL inválida…).
+                if isinstance(tab_a, str) and tab_a.startswith("❌"):
+                    return (
+                        gr.update(visible=False),
+                        gr.update(visible=False),
+                        gr.update(),
+                        gr.update(visible=False),
+                        aurora.render_stepper(3),
+                        3,
+                        gr.update(value=aurora.render_alert(tab_a, "bad"), visible=True),
+                        gr.update(),
+                        None,
+                        None,
+                        None,
+                    )
+
+                # Recuperamos el payload completo (cv_full_analyzer cachea por hash)
+                # No exponemos las dataclasses ricas, las regeneramos desde tab_X.
+                # Más simple: reusamos los datos ya cacheados del analyzer.
+                cache = next(iter(self.full_analyzer._cache.values()), {})
+                results_payload = cache if cache else {
+                    "A_diagnosis": {},
+                    "B_keywords": {},
+                    "C_changes": {},
+                    "F_checklist": {},
+                    "E_variants": {},
+                }
+
+                cv_text_for_preview = tab_d if isinstance(tab_d, str) else ""
+                html_block = self._build_results_html(
+                    results_payload,
+                    rol_objetivo or "",
+                    idioma or "ES",
+                    longitud or "2 páginas",
+                    pais or "",
+                    cv_text_for_preview,
+                    has_files=bool(txt_path or docx_path),
+                )
+
+                return (
+                    gr.update(visible=False),  # step1
+                    gr.update(visible=False),  # step2
+                    gr.update(visible=False),  # step3
+                    gr.update(visible=True),   # step4
+                    aurora.render_stepper(4),
+                    4,
+                    gr.update(visible=False),  # alert s3
+                    html_block,                # results_html
+                    cv_text_for_preview,       # s4_cv_textbox
+                    txt_path,
+                    docx_path,
+                )
+
+            # ── Wiring de eventos ─────────────────────────────────────
+
+            common_nav_outputs = [g_step1, g_step2, g_step3, g_step4, stepper_html, state_step]
+
+            s1_next.click(
+                fn=go_step1_next,
+                inputs=[s1_cv_file],
+                outputs=common_nav_outputs + [s1_alert],
+            )
+            s2_prev.click(fn=lambda: _goto(1), inputs=[], outputs=common_nav_outputs)
+            s2_next.click(
+                fn=go_step2_next,
+                inputs=[s2_job_url, s2_job_text],
+                outputs=common_nav_outputs + [s2_alert],
+            )
+            s3_prev.click(fn=lambda: _goto(2), inputs=[], outputs=common_nav_outputs)
+
+            s3_analyze.click(
+                fn=run_analysis,
+                inputs=[
+                    s1_cv_file, s2_job_url, s2_job_text,
+                    s3_idioma, s3_longitud, s3_pais, s3_rol, s3_nivel,
+                ],
+                outputs=common_nav_outputs + [
+                    s3_status,           # alert paso 3
+                    results_html,        # bloque HTML del paso 4
+                    s4_cv_textbox,
+                    s4_download_txt,
+                    s4_download_docx,
+                ],
+            )
+            s4_prev.click(fn=lambda: _goto(3), inputs=[], outputs=common_nav_outputs)
+            s4_new.click(
+                fn=go_new_analysis,
+                inputs=[],
+                outputs=common_nav_outputs + [s1_alert, s2_alert, s3_status],
+            )
+
+            # Al cargar, colapsar al Paso 1. El Paso 3 se crea visible=True para
+            # forzar su render inicial (evita el bug de Gradio 6 con dropdowns en
+            # columnas perezosas); este load lo oculta hasta que se navegue a él.
+            app.load(fn=lambda: _goto(1), inputs=[], outputs=common_nav_outputs)
+
         return app
+
 
 def launch_app():
     """Lanza la aplicación"""
